@@ -172,7 +172,7 @@ function pickMsgType(msg) {
 
 // ===================== Config inyectable desde server.js =====================
 let CFG = {
-  url_sistema: 'https://whatsflash.app',
+  url_sistema: 'https://wsp.guibis.com',
   endpoint: '/dev/wspguibis/system_gtp',
   endpoint_salida: '/dev/wspguibis/system_gtp_salientes'
 };

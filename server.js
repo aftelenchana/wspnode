@@ -14,7 +14,7 @@ const { promisify } = require('util');
 const stream = require('stream');
 
 // === Tus constantes (SIN CAMBIOS) ===
-const url_sistema = 'https://whatsflash.app';
+const url_sistema = 'https://wsp.guibis.com';
 const endpoint = '/dev/wspguibis/system_gtp';
 const endpoint_salida = '/dev/wspguibis/system_gtp_salientes';
 
