@@ -1,16 +1,15 @@
-FROM node:14
+FROM node:22-bullseye
 
 WORKDIR /usr/src/app
 
 COPY package*.json ./
-RUN npm install
 
-# Instala PM2 globalmente
-RUN npm install pm2 -g
+RUN npm ci --omit=dev
+
+RUN npm install -g pm2
 
 COPY . .
 
 EXPOSE 3000
 
-# Comando para iniciar la aplicación con PM2
-CMD ["pm2-runtime", "start", "server.js", "--name", "my-node-app"]
+CMD ["pm2-runtime", "server.js"]
