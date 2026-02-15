@@ -45,6 +45,42 @@ const ECUADOR_TZ_OFFSET_HOURS = -5;
 const SCHEDULES = new Map();
 const IN_FLIGHT = new Set();
 
+// ==================== LOCK por archivo (anti-doble-proceso) ====================
+// Nota: esto evita dobles envíos cuando una campaña diferida se dispara por timeout y por guardia al mismo tiempo.
+// El lock es a nivel filesystem, así que incluso si hay re-entradas o dos disparadores, solo uno procesa.
+function lockPathFor(filePath) { return `${filePath}.lock`; }
+
+function acquireFileLock(filePath) {
+  const lp = lockPathFor(filePath);
+  try {
+    // si el JSON no existe, no tiene sentido lockear
+    if (!fs.existsSync(filePath)) return { ok: false, reason: 'no_json' };
+
+    // openSync con 'wx' falla si ya existe
+    const fd = fs.openSync(lp, 'wx');
+    const meta = { pid: process.pid, at: new Date().toISOString(), file: filePath };
+    try { fs.writeFileSync(fd, JSON.stringify(meta, null, 2)); } catch {}
+    try { fs.closeSync(fd); } catch {}
+    return { ok: true, lockPath: lp };
+  } catch (e) {
+    // lock ya existe
+    if (e && (e.code === 'EEXIST' || e.code === 'EACCES')) return { ok: false, reason: 'locked', lockPath: lp };
+    return { ok: false, reason: e?.code || e?.message || 'lock_error', lockPath: lp };
+  }
+}
+
+function releaseFileLock(filePath) {
+  const lp = lockPathFor(filePath);
+  try { if (fs.existsSync(lp)) fs.unlinkSync(lp); } catch {}
+}
+
+// ==================== Normalización de número (dedupe) ====================
+function normalizeNumber(n) {
+  const s = String(n || '');
+  const digits = s.replace(/\D+/g, '');
+  return digits || s.trim();
+}
+
 module.exports = function registerEnvioMasivo(app, opts = {}) {
   // 🟢 Desde server.js
   const urlSistemaBase = opts.urlSistema;
@@ -220,201 +256,96 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
       if (keys.length === 1 && keys[0].trim().startsWith('{')) {
         try {
           const parsed = JSON.parse(keys[0]);
-          dbg('extractPayload: via clave única estilo PHP');
+          dbg('extractPayload: via key única (PHP)');
           return parsed;
         } catch (e) {
-          dbg('extractPayload: clave única inválida', e.message);
+          dbg('extractPayload: key única inválida', e.message);
         }
       }
     }
 
+    // Si llegó como string plano
     if (typeof b === 'string') {
       try {
         const parsed = JSON.parse(b);
         dbg('extractPayload: string JSON');
         return parsed;
-      } catch (e) {
-        dbg('extractPayload: string no JSON', e.message);
-      }
+      } catch {}
     }
 
-    warn('extractPayload: no se pudo interpretar el body');
+    dbg('extractPayload: no se pudo interpretar');
     return null;
   }
 
-  const postStatus = async (body) => {
+  // ==================== STATUS REPORT ====================
+  async function postStatus(payload) {
     try {
-      const toSend = { ...body, timestamp: new Date().toISOString() };
-      dbg('POST estado.php → body:', pretty(toSend));
-      const resp = await axios.post(cfg.statusEndpoint, toSend, { timeout: 20000 });
-      dbg('POST estado.php ← status:', resp.status, 'resp:', pretty(resp.data));
-    } catch (e) {
-      const st = e?.response?.status;
-      const data = e?.response?.data;
-      error('postStatus ERROR', st, typeof data === 'string' ? data.slice(0, 200) : data);
-    }
-  };
-
-  // ==================== ✅ EXISTENCIA: POST JSON a /dev/existencia.php ====================
-  async function reportExistencia(payload) {
-    // payload: { sessionId, numero, exists (true/false/null), sent (true/false), motivo, ...extra }
-    try {
-      const body = {
-        ...payload,
-        ts: payload.ts || new Date().toISOString()
-      };
-
-      dbg('POST existencia.php (JSON) → url:', cfg.existenciaEndpoint, 'body:', pretty(body));
-      const resp = await axios.post(
-        cfg.existenciaEndpoint,
-        body,
-        {
-          timeout: 15000,
-          headers: { 'Content-Type': 'application/json' },
-          validateStatus: () => true
-        }
-      );
-      dbg('POST existencia.php (JSON) ← status:', resp.status, 'resp:', pretty(resp.data));
-      return { ok: resp.status >= 200 && resp.status < 300, status: resp.status, data: resp.data };
-    } catch (e) {
-      logHttpFailure('reportExistencia(JSON)', e);
-      return { ok: false, error: e?.message || String(e) };
-    }
-  }
-
-  // ==================== ✅ CHEQUEO WHATSAPP (antes de enviar) ====================
-  // Usa el server de WhatsApp (campana.url) + endpoint fijo /check-whatsapp
-  // Debe responder algo tipo { ok:true, exists:true/false } o { exists:true/false }
-  async function checkWhatsAppNumber(baseUrl, sessionId, numero) {
-    const url = `${String(baseUrl).replace(/\/+$/, '')}/check-whatsapp`;
-    const body = { sessionId, number: String(numero) };
-
-    try {
-      dbg('POST check-whatsapp → url:', url, 'body:', pretty(body));
-      const r = await axios.post(url, body, {
+      await axios.post(cfg.statusEndpoint, payload, {
         timeout: 15000,
-        headers: { 'Content-Type': 'application/json' },
-        validateStatus: () => true
+        headers: { 'Content-Type': 'application/json' }
       });
-
-      dbg('POST check-whatsapp ← status:', r.status, 'resp:', pretty(r.data));
-
-      if (r.status >= 200 && r.status < 300) {
-        const d = r.data || {};
-        // soporta varias formas:
-        const exists =
-          (typeof d.exists === 'boolean') ? d.exists :
-          (typeof d.ok === 'boolean' && typeof d.data?.exists === 'boolean') ? d.data.exists :
-          (Array.isArray(d) && typeof d[0]?.exists === 'boolean') ? d[0].exists :
-          null;
-
-        if (typeof exists === 'boolean') return { ok: true, exists, raw: d };
-        return { ok: false, exists: null, raw: d, error: 'Respuesta sin boolean exists' };
-      }
-
-      return { ok: false, exists: null, raw: r.data, error: `HTTP_${r.status}` };
     } catch (e) {
-      return { ok: false, exists: null, error: e?.message || String(e) };
+      logHttpFailure('postStatus', e);
     }
   }
 
-  // ========= Tokens dinámicos #ID# (via variables_globales POR POST) =========
-  const tokenRegex = /#(\d+)#/g;
-
-  async function fetchVarAlternatives(id) {
-    const url = cfg.varsApiEndpoint;
-
-    // Intento 1: POST JSON
+  // ==================== VARIABLES GLOBALES / TOKENS ====================
+  async function fetchVariablesGlobales() {
     try {
-      const body = { id };
-      dbg('POST variables_globales (JSON) → url:', url, 'body:', pretty(body));
-      const resp = await axios.post(
-        url,
-        body,
-        { timeout: 15000, validateStatus: () => true, headers: { 'Content-Type': 'application/json' } }
-      );
-      dbg('POST variables_globales (JSON) ← status:', resp.status, 'resp:', pretty(resp.data));
-
-      if (resp.status >= 200 && resp.status < 300) {
-        const data = resp?.data || {};
-        const rawText =
-          (typeof data.texto === 'string' ? data.texto :
-           (typeof data?.data?.texto === 'string' ? data.data.texto : ''));
-        const arr = String(rawText)
-          .split(',')
-          .map(s => s.trim())
-          .filter(s => s.length > 0);
-        dbg(`fetchVarAlternatives #${id}# (JSON): opciones=${arr.length}`, arr);
-        return arr;
-      }
-      warn(`fetchVarAlternatives(JSON): HTTP ${resp.status}`);
+      const r = await axios.post(cfg.varsApiEndpoint, {}, { timeout: 15000 });
+      return r.data;
     } catch (e) {
-      logHttpFailure('fetchVarAlternatives(JSON)', e);
+      logHttpFailure('variables_globales', e);
+      return null;
+    }
+  }
+
+  const TOKEN_REGEX = /##([a-zA-Z0-9_]+)##/g;
+
+  function makeTokenReplacer(vars) {
+    const map = new Map();
+    if (vars && typeof vars === 'object') {
+      for (const [k, v] of Object.entries(vars)) {
+        if (!k) continue;
+        // Permitimos que cada token sea string o array
+        map.set(k, v);
+      }
     }
 
-    // Intento 2: POST x-www-form-urlencoded (PHP amigable)
+    function pickValue(val) {
+      if (Array.isArray(val)) {
+        if (!val.length) return '';
+        return val[randomInt(0, val.length)] ?? '';
+      }
+      if (val === null || val === undefined) return '';
+      return String(val);
+    }
+
+    return {
+      replaceWithRandom(text) {
+        if (!text) return text;
+        return String(text).replace(TOKEN_REGEX, (_m, token) => {
+          if (!map.has(token)) return '';
+          return pickValue(map.get(token));
+        });
+      }
+    };
+  }
+
+  async function prepareTokenReplacer(message) {
     try {
-      const params = new URLSearchParams();
-      params.append('id', String(id));
-      dbg('POST variables_globales (FORM) → url:', url, 'body:', pretty(params.toString()));
-      const resp = await axios.post(
-        url,
-        params,
-        { timeout: 15000, validateStatus: () => true, headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
-      );
-      dbg('POST variables_globales (FORM) ← status:', resp.status, 'resp:', pretty(resp.data));
+      const varsResp = await fetchVariablesGlobales();
+      const vars = varsResp?.variables || varsResp?.data || varsResp || {};
+      const replacer = makeTokenReplacer(vars);
 
-      if (resp.status >= 200 && resp.status < 300) {
-        const data = resp?.data || {};
-        const rawText =
-          (typeof data.texto === 'string' ? data.texto :
-           (typeof data?.data?.texto === 'string' ? data.data.texto : ''));
-        const arr = String(rawText)
-          .split(',')
-          .map(s => s.trim())
-          .filter(s => s.length > 0);
-        dbg(`fetchVarAlternatives #${id}# (FORM): opciones=${arr.length}`, arr);
-        return arr;
-      }
-      warn(`fetchVarAlternatives(FORM): HTTP ${resp.status}`);
+      // Validación liviana
+      const test = replacer.replaceWithRandom(message || '');
+      dbg('Token test (preview):', (test || '').slice(0, 120));
+      return replacer;
     } catch (e) {
-      logHttpFailure('fetchVarAlternatives(FORM)', e);
+      warn('prepareTokenReplacer fallback:', e?.message || e);
+      return makeTokenReplacer({});
     }
-
-    warn(`No se pudo obtener texto para #${id}# via POST en ${url}`);
-    return [];
-  }
-
-  function pickRandom(arr) {
-    if (!Array.isArray(arr) || arr.length === 0) return '';
-    if (arr.length === 1) return arr[0];
-    const idx = randomInt(0, arr.length);
-    dbg('pickRandom: len=', arr.length, 'idx=', idx);
-    return arr[idx];
-  }
-
-  async function prepareTokenReplacer(template) {
-    const ids = Array.from(new Set([...String(template || '').matchAll(tokenRegex)].map(m => m[1])));
-    dbg('prepareTokenReplacer ids:', ids);
-
-    const cache = new Map();
-    for (const id of ids) {
-      const opts = await fetchVarAlternatives(id);
-      cache.set(id, opts);
-    }
-
-    const replaceWithRandom = (msg) => String(msg).replace(tokenRegex, (_full, id) => {
-      const opts = cache.get(id) || [];
-      if (!opts.length) {
-        dbg(`replaceWithRandom: #${id}# sin opciones -> ''`);
-        return '';
-      }
-      const choice = pickRandom(opts);
-      dbg(`replaceWithRandom: #${id}# opciones=`, opts, '→ elegido=', choice);
-      return choice;
-    });
-
-    return { replaceWithRandom, hasTokens: ids.length > 0 };
   }
 
   // ========= Params dinámicos ##paramN## =========
@@ -551,7 +482,7 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
       const snapshot = {
         ...payload,
         estado_campana: 'pendiente', // pendiente | en_proceso | finalizada | error | cancelado
-        progreso: {},                // { [destId]: { sent: true, at: ISO } }
+        progreso: {},                // { [numero_normalizado]: { sent: true, at: ISO, ... } }
         created_at: new Date().toISOString()
       };
       saveJSON(filePath, snapshot);
@@ -559,366 +490,535 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
       logAction('inicio', {
         id_campana: campana.id,
         archivo: filePath,
-        modo,
+        modo: modo,
         total_destinatarios: destinatarios.length,
-        solo_registro: true
+        preview_only: true
       });
 
-      info('Campaña registrada:', id, 'modo:', modo, 'destinatarios:', destinatarios.length);
+      res.json({ ok: true, message: 'Preview guardado.', filePath });
+
+    } catch (e) {
+      error('Error /masivo/preview', e?.message || e);
+      res.status(500).json({ ok: false, message: 'Error interno', error: e?.message || String(e) });
+    }
+  });
+
+  app.post('/masivo/iniciar', async (req, res) => {
+    try {
+      const payload = extractPayload(req);
+      if (!payload || payload.ok !== true || !payload.campana || !Array.isArray(payload.destinatarios)) {
+        return res.status(400).json({ ok: false, message: 'Body inválido' });
+      }
+
+      const campana = payload.campana;
+      const modo = String(campana.modo_tiempo || '').toLowerCase();
+      const id = String(campana.id || '').trim();
+      if (!id) return res.status(400).json({ ok: false, message: 'campana.id inválido' });
+      if (!['en_tiempo_real', 'diferido'].includes(modo)) return res.status(400).json({ ok: false, message: 'modo_tiempo inválido' });
+
+      const baseUrl = String(campana.url || '').replace(/\/+$/, '');
+      const sessionId = String(campana.key_wsp || '').trim();
+
+      // Preflight para en_tiempo_real
+      const pre = await preflightSessionOrError(modo, baseUrl, sessionId);
+      if (!pre.ok && modo === 'en_tiempo_real') {
+        return res.status(400).json({
+          ok: false,
+          message: 'Sesión no encontrada en la memoria del servidor de WhatsApp.',
+          detalle: pre.reason,
+          server: pre.server || null,
+          sugerencia: 'Inicia la sesión con /start-session y escanea el QR, o usa el sessionId correcto.'
+        });
+      }
+
+      const filePath = campaignPathByMode(modo, id);
+
+      const snapshot = {
+        ...payload,
+        estado_campana: 'pendiente',
+        progreso: payload.progreso && typeof payload.progreso === 'object' ? payload.progreso : {},
+        created_at: new Date().toISOString()
+      };
+      saveJSON(filePath, snapshot);
+
+      logAction('inicio', {
+        id_campana: campana.id,
+        archivo: filePath,
+        modo: modo,
+        total_destinatarios: payload.destinatarios.length,
+        iniciar: true
+      });
 
       if (modo === 'en_tiempo_real') {
         processCampaignFile(filePath, { modeLabel: 'en_tiempo_real' }).catch(error);
       } else {
-        if (!pre.ok) warn('Registro diferido con sesión no en memoria actualmente:', sessionId);
         scheduleDiferido(filePath);
       }
 
-      return res.json({
-        ok: true,
-        message: 'Campaña registrada correctamente.',
-        resumen: {
-          id: campana.id,
-          iduser: campana.iduser,
-          empresa: campana.empresa,
-          metodo_envio: campana.metodo_envio,
-          intervalo_seg: Number(campana.intervalo_tiempo) || null,
-          mensajes_para_pausa: Number(campana.mensajes_para_pausa) || 0,
-          tiempo_para_cantidad: String(campana.tiempo_para_cantidad || ''),
-          modo_tiempo: modo,
-          total_destinatarios: destinatarios.length,
-          archivo: `/campanas/${modo}/${id}.json`,
-          programado_para: campana.fecha_hora_envio || null,
-          accion: campana.accion || null
-        }
-      });
-    } catch (err) {
-      error('Error en /masivo/preview:', err?.message || err);
-      return res.status(500).json({ ok: false, message: 'Error interno al registrar la campaña.' });
+      res.json({ ok: true, message: 'Campaña registrada', filePath });
+
+    } catch (e) {
+      error('Error /masivo/iniciar', e?.message || e);
+      res.status(500).json({ ok: false, message: 'Error interno', error: e?.message || String(e) });
     }
   });
 
+  app.post('/masivo/cancelar', (req, res) => {
+    try {
+      const body = req.body || {};
+      const id = String(body.id_campana || body.id || '').trim();
+      const modo = String(body.modo_tiempo || 'diferido').toLowerCase();
+
+      if (!id) return res.status(400).json({ ok: false, message: 'Falta id_campana' });
+
+      const filePath = campaignPathByMode(modo, id);
+      const data = loadJSON(filePath);
+      if (!data || !data.campana) return res.status(404).json({ ok: false, message: 'Campaña no encontrada' });
+
+      data.estado_campana = 'cancelado';
+      saveJSON(filePath, data);
+
+      // limpiar timeout si estaba programada
+      if (SCHEDULES.has(filePath)) {
+        try { clearTimeout(SCHEDULES.get(filePath)); } catch {}
+        SCHEDULES.delete(filePath);
+      }
+
+      logAction('cancelar', { id_campana: data.campana.id, archivo: filePath, modo });
+
+      res.json({ ok: true, message: 'Campaña cancelada', filePath });
+    } catch (e) {
+      error('Error /masivo/cancelar', e?.message || e);
+      res.status(500).json({ ok: false, message: 'Error interno', error: e?.message || String(e) });
+    }
+  });
+
+  // ==================== WHATSAPP CHECK / REPORT EXISTENCIA ====================
+  async function checkWhatsAppNumber(baseUrl, sessionId, numero) {
+    const url = `${baseUrl}/check-number`;
+    const body = { sessionId, number: numero };
+    try {
+      dbg('POST check-number → url:', url, 'body:', pretty(body));
+      const r = await axios.post(url, body, { timeout: 15000, headers: { 'Content-Type': 'application/json' } });
+      dbg('POST check-number ← status:', r.status, 'resp:', pretty(r.data));
+
+      // se espera algo tipo { exists: true/false }
+      const exists = (typeof r.data?.exists === 'boolean') ? r.data.exists : (typeof r.data === 'boolean' ? r.data : null);
+      return { ok: true, exists, raw: r.data };
+    } catch (e) {
+      const st = e?.response?.status;
+      const data = e?.response?.data;
+      warn('POST check-number ERROR status:', st, 'resp:', pretty(data), 'msg:', e?.message);
+      return { ok: false, exists: null, error: e?.message || 'error_check', raw: data };
+    }
+  }
+
+  async function reportExistencia(payload) {
+    try {
+      await axios.post(cfg.existenciaEndpoint, payload, {
+        timeout: 15000,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    } catch (e) {
+      logHttpFailure('existencia', e);
+    }
+  }
+
   // ==================== PROCESADOR ====================
   async function processCampaignFile(filePath, { modeLabel }) {
-    // Evitar dobles ejecuciones
-    if (IN_FLIGHT.has(filePath)) {
-      logAction('envio_mensaje', { fase: 'skip_duplicado', archivo: filePath, motivo: 'IN_FLIGHT' });
-      await postStatus({ action: 'skip_duplicado', id_campana: loadJSON(filePath)?.campana?.id || 0, fase: 'skip_duplicado' });
-      dbg('IN_FLIGHT detectado, skip', filePath);
+    // 🔒 Lock filesystem (anti doble disparo)
+    const lock = acquireFileLock(filePath);
+    if (!lock.ok) {
+      const cid = loadJSON(filePath)?.campana?.id || 0;
+      logAction('envio_mensaje', { fase: 'skip_duplicado', archivo: filePath, motivo: `LOCK:${lock.reason}` });
+      await postStatus({ action: 'skip_duplicado', id_campana: cid, fase: 'skip_duplicado' });
+      dbg('LOCK detectado, skip', filePath, lock.reason);
       return;
     }
+
+    // Evitar dobles ejecuciones en memoria (misma instancia)
+    if (IN_FLIGHT.has(filePath)) {
+      const cid = loadJSON(filePath)?.campana?.id || 0;
+      logAction('envio_mensaje', { fase: 'skip_duplicado', archivo: filePath, motivo: 'IN_FLIGHT' });
+      await postStatus({ action: 'skip_duplicado', id_campana: cid, fase: 'skip_duplicado' });
+      dbg('IN_FLIGHT detectado, skip', filePath);
+      releaseFileLock(filePath);
+      return;
+    }
+
     IN_FLIGHT.add(filePath);
     info('Procesando campaña:', path.basename(filePath), 'modo:', modeLabel);
 
     const startedAt = Date.now();
-    let data = loadJSON(filePath);
-    if (!data || !data.campana || !Array.isArray(data.destinatarios)) {
-      warn('JSON de campaña inválido, aborta', filePath);
-      IN_FLIGHT.delete(filePath);
-      return;
-    }
 
-    // 🔒 Check 0: si está cancelada, no arrancar
-    if (String(data.estado_campana || '').toLowerCase() === 'cancelado') {
-      info('Campaña en estado "cancelado". No se procesa.', filePath);
-      await postStatus({ action: 'cancelado', id_campana: data.campana.id, fase: 'inicio' });
-      IN_FLIGHT.delete(filePath);
-      return;
-    }
-
-    const currentState = data.estado_campana || 'pendiente';
-    if (currentState === 'en_proceso' || currentState === 'finalizada') {
-      dbg('Estado no ejecutable, aborta:', currentState);
-      IN_FLIGHT.delete(filePath);
-      return;
-    }
-
-    const { campana } = data;
-    const baseUrl  = String(campana.url || '').replace(/\/+$/, '');
-    const sendUrl  = `${baseUrl}/send-message`;
-    const sessionId = String(campana.key_wsp || '').trim();
-
-    // Tiempos
-    const intervalMs = Number.isFinite(Number(campana.intervalo_tiempo))
-      ? Number(campana.intervalo_tiempo) * 1000
-      : toMs(String(campana.intervalo_tiempo || '').trim());
-    const pausaCada = Math.max(0, parseInt(campana.mensajes_para_pausa, 10) || 0);
-    const pausaMs   = toMs(String(campana.tiempo_para_cantidad || '').trim());
-
-    // Diferido: respeta hora exacta si guardia disparó antes (usando hora de Guayaquil)
-    if (String(modeLabel).toLowerCase() === 'diferido') {
-      const when = parseLocalDateTime(campana.fecha_hora_envio);
-      const delayToStart = Math.max(0, when.getTime() - Date.now());
-      if (delayToStart > 0) {
-        info('Esperando hasta hora programada (Guayaquil)', when.toISOString());
-        await sleep(delayToStart);
-      }
-    }
-
-    // Preparar reemplazos de tokens variables_globales
-    const tokenReplacer = await prepareTokenReplacer(campana.mensaje);
-
-    logAction('inicio', {
-      id_campana: campana.id,
-      archivo: filePath,
-      modo: String(modeLabel),
-      url_destino: sendUrl,
-      sessionId,
-      mensaje_resumen: (campana.mensaje || '').slice(0, 100),
-      intervalo_ms: intervalMs,
-      pausa_cada: pausaCada,
-      pausa_ms: pausaMs,
-      total_destinatarios: Array.isArray(data.destinatarios) ? data.destinatarios.length : 0,
-      fecha_hora_envio: campana.fecha_hora_envio || null
-    });
-
-    await postStatus({ action: 'inicio', id_campana: campana.id });
-    data.estado_campana = 'en_proceso';
-    saveJSON(filePath, data);
-
-    let errores = 0;
-
-    const jobs = data.destinatarios.map((d) => {
-      const parts = String(d.numero || '').split('-'); // ["5939...", "Alex", "mail", ...]
-      const toNumber = (parts[0] || '').trim();       // 👈 número CRUDO como mandas (5939988...)
-      return { row: d, to: toNumber, parts };
-    }).filter(j => j.to);
-
-    for (let i = 0; i < jobs.length; i++) {
-      // 🔒 Check 1: justo antes de enviar a cada destinatario
-      const latest = loadJSON(filePath) || data;
-      if (String(latest.estado_campana || '').toLowerCase() === 'cancelado') {
-        info('Cancelado detectado antes de enviar el siguiente mensaje. Se detiene el proceso.', filePath);
-        await postStatus({ action: 'cancelado', id_campana: latest.campana.id, fase: 'antes_de_envio' });
-        IN_FLIGHT.delete(filePath);
+    try {
+      let data = loadJSON(filePath);
+      if (!data || !data.campana || !Array.isArray(data.destinatarios)) {
+        warn('JSON de campaña inválido, aborta', filePath);
         return;
       }
 
-      const j = jobs[i];
-      const key = String(j.row.id ?? j.to);
-      const prog = (latest.progreso && latest.progreso[key]) || data.progreso[key] || {};
-
-      if (prog.sent === true) {
-        dbg('skip ya enviado', key);
-        continue;
+      // 🔒 Check 0: si está cancelada, no arrancar
+      if (String(data.estado_campana || '').toLowerCase() === 'cancelado') {
+        info('Campaña en estado "cancelado". No se procesa.', filePath);
+        await postStatus({ action: 'cancelado', id_campana: data.campana.id, fase: 'inicio' });
+        return;
       }
 
-      // Mensaje por destinatario (respeta template exacto)
-      const messageTemplate = String(campana.mensaje);
-      const replaceParams   = makeParamReplacerFromParts(j.parts);
-      const withParams      = replaceParams(messageTemplate);
-      const msgForThisRecipient = tokenReplacer.replaceWithRandom(withParams);
+      const currentState = data.estado_campana || 'pendiente';
+      if (currentState === 'en_proceso' || currentState === 'finalizada') {
+        dbg('Estado no ejecutable, aborta:', currentState);
+        return;
+      }
 
-      // ==================== ✅ 1) CHECK EXISTENCIA WHATSAPP ====================
-      const check = await checkWhatsAppNumber(baseUrl, sessionId, j.to);
+      const { campana } = data;
+      const baseUrl  = String(campana.url || '').replace(/\/+$/, '');
+      const sendUrl  = `${baseUrl}/send-message`;
+      const sessionId = String(campana.key_wsp || '').trim();
 
-      // Reporte a existencia.php SIEMPRE (exista o no)
-      await reportExistencia({
-        tipo: 'check',
-        sessionId,
-        numero: j.to,
-        exists: (typeof check.exists === 'boolean') ? check.exists : null,
-        sent: false,
-        motivo: check.ok
-          ? (check.exists ? 'tiene_whatsapp' : 'no_tiene_whatsapp')
-          : 'error_check',
-        extra: {
-          check_ok: check.ok,
-          check_error: check.error || null,
-          check_raw: check.raw || null
+      // Tiempos
+      const intervalMs = Number.isFinite(Number(campana.intervalo_tiempo))
+        ? Number(campana.intervalo_tiempo) * 1000
+        : toMs(String(campana.intervalo_tiempo || '').trim());
+      const pausaCada = Math.max(0, parseInt(campana.mensajes_para_pausa, 10) || 0);
+      const pausaMs   = toMs(String(campana.tiempo_para_cantidad || '').trim());
+
+      // Diferido: respeta hora exacta si guardia disparó antes (usando hora de Guayaquil)
+      if (String(modeLabel).toLowerCase() === 'diferido') {
+        const when = parseLocalDateTime(campana.fecha_hora_envio);
+        const delayToStart = Math.max(0, when.getTime() - Date.now());
+        if (delayToStart > 0) {
+          info('Esperando hasta hora programada (Guayaquil)', when.toISOString());
+          await sleep(delayToStart);
         }
-      });
-
-      // Si NO existe, NO enviamos
-      if (!check.ok || check.exists !== true) {
-        logAction('envio_mensaje', {
-          fase: 'skip_no_whatsapp',
-          id_campana: campana.id,
-          archivo: filePath,
-          idx: i,
-          destinatario_id: j.row.id ?? key,
-          numero: j.to,
-          motivo: !check.ok ? 'error_check' : 'no_tiene_whatsapp'
-        });
-
-        // marcar como "sent" en progreso? (si quieres NO reintentar nunca)
-        // aquí lo dejamos NO enviado para que puedas reintentar si luego cambias lógica.
-        continue;
       }
 
-      // ==================== ✅ 2) ENVIAR MENSAJE (solo si exists=true) ====================
-      const body = { sessionId, to: j.to, message: msgForThisRecipient };
-      dbg('POST send-message → url:', sendUrl, 'body:', pretty(body));
+      // Preparar reemplazos de tokens variables_globales
+      const tokenReplacer = await prepareTokenReplacer(campana.mensaje);
 
-      logAction('envio_mensaje', {
-        fase: 'antes',
+      logAction('inicio', {
         id_campana: campana.id,
         archivo: filePath,
-        idx: i,
-        destinatario: {
-          id: j.row.id ?? key,
-          numero: j.to,
-          tipo: j.row.tipo,
-          estado_envio: j.row.estado_envio
-        },
-        body
+        modo: String(modeLabel),
+        url_destino: sendUrl,
+        sessionId,
+        mensaje_resumen: (campana.mensaje || '').slice(0, 100),
+        intervalo_ms: intervalMs,
+        pausa_cada: pausaCada,
+        pausa_ms: pausaMs,
+        total_destinatarios: Array.isArray(data.destinatarios) ? data.destinatarios.length : 0,
+        fecha_hora_envio: campana.fecha_hora_envio || null
       });
 
-      try {
-        const resp = await axios.post(sendUrl, body, {
-          timeout: 30000,
-          headers: { 'Content-Type': 'application/json' }
-        });
+      await postStatus({ action: 'inicio', id_campana: campana.id });
+      data.estado_campana = 'en_proceso';
+      saveJSON(filePath, data);
 
-        dbg('POST send-message ← status:', resp.status, 'resp:', pretty(resp.data));
+      let errores = 0;
 
-        // Reporte a existencia.php: enviado_ok
+      const jobs = data.destinatarios.map((d) => {
+        const parts = String(d.numero || '').split('-'); // ["5939...", "Alex", "mail", ...]
+        const toNumber = (parts[0] || '').trim();       // 👈 número CRUDO como mandas (5939988...)
+        return { row: d, to: toNumber, parts };
+      }).filter(j => j.to);
+
+      for (let i = 0; i < jobs.length; i++) {
+        // 🔒 Check 1: justo antes de enviar a cada destinatario
+        const latest = loadJSON(filePath) || data;
+        if (String(latest.estado_campana || '').toLowerCase() === 'cancelado') {
+          info('Cancelado detectado antes de enviar el siguiente mensaje. Se detiene el proceso.', filePath);
+          await postStatus({ action: 'cancelado', id_campana: latest.campana.id, fase: 'antes_de_envio' });
+          return;
+        }
+
+        const j = jobs[i];
+
+        // ✅ Dedupe por número (no por id) para evitar dobles envíos si el mismo número aparece con IDs distintos
+        const rowId = (j.row && (j.row.id !== undefined && j.row.id !== null)) ? j.row.id : null;
+        const key = normalizeNumber(j.to);
+
+        const prog = (latest.progreso && latest.progreso[key]) || data.progreso[key] || {};
+
+        // si ya está enviado o alguien lo está enviando, saltar
+        if (prog.sent === true || prog.sending === true) {
+          dbg('skip ya procesado', key, { sent: !!prog.sent, sending: !!prog.sending });
+          continue;
+        }
+
+        // 🔒 Marcar "sending" ANTES de check/envío para evitar carreras (especialmente en diferido)
+        try {
+          const live0 = loadJSON(filePath) || data;
+          live0.progreso = live0.progreso || {};
+          const prev0 = live0.progreso[key] || {};
+          live0.progreso[key] = {
+            ...prev0,
+            sending: true,
+            sent: false,
+            started_at: new Date().toISOString(),
+            row_id: rowId,
+            numero: j.to
+          };
+          saveJSON(filePath, live0);
+          data = live0;
+        } catch (e) {
+          warn('No se pudo marcar sending (continúo igual):', e?.message || e);
+        }
+
+        // Mensaje por destinatario (respeta template exacto)
+        const messageTemplate = String(campana.mensaje);
+        const replaceParams   = makeParamReplacerFromParts(j.parts);
+        const withParams      = replaceParams(messageTemplate);
+        const msgForThisRecipient = tokenReplacer.replaceWithRandom(withParams);
+
+        // ==================== ✅ 1) CHECK EXISTENCIA WHATSAPP ====================
+        const check = await checkWhatsAppNumber(baseUrl, sessionId, j.to);
+
+        // Reporte a existencia.php SIEMPRE (exista o no)
         await reportExistencia({
-          tipo: 'send',
+          tipo: 'check',
           sessionId,
           numero: j.to,
-          exists: true,
-          sent: true,
-          motivo: 'enviado_ok',
-          extra: { http_status: resp.status, resp: resp.data }
-        });
-
-        logAction('envio_mensaje', {
-          fase: 'exito',
-          id_campana: campana.id,
-          archivo: filePath,
-          idx: i,
-          destinatario_id: j.row.id ?? key,
-          numero: j.to,
-          http_status: resp.status
-        });
-
-        await postStatus({
-          action: 'envio_mensaje',
-          id_campana: campana.id,
-          destinatario_id: j.row.id,
-          fase: 'exito'
-        });
-
-        // guardamos progreso
-        const live = loadJSON(filePath) || data;
-        live.progreso = live.progreso || {};
-        live.progreso[key] = { sent: true, at: new Date().toISOString() };
-        saveJSON(filePath, live);
-        data = live;
-      } catch (e) {
-        errores++;
-        const st = e?.response?.status;
-        const dd = e?.response?.data;
-
-        dbg('POST send-message ← ERROR status:', st, 'resp:', pretty(dd), 'msg:', e?.message);
-
-        // Reporte a existencia.php: error_envio
-        await reportExistencia({
-          tipo: 'send',
-          sessionId,
-          numero: j.to,
-          exists: true,
+          exists: (typeof check.exists === 'boolean') ? check.exists : null,
           sent: false,
-          motivo: 'error_envio',
-          extra: { http_status: st || null, error: e?.message || 'Error envío', resp: dd || null }
+          motivo: check.ok
+            ? (check.exists ? 'tiene_whatsapp' : 'no_tiene_whatsapp')
+            : 'error_check',
+          extra: {
+            check_ok: check.ok,
+            check_error: check.error || null,
+            check_raw: check.raw || null
+          }
         });
 
+        // Si NO existe, NO enviamos
+        if (!check.ok || check.exists !== true) {
+          logAction('envio_mensaje', {
+            fase: 'skip_no_whatsapp',
+            id_campana: campana.id,
+            archivo: filePath,
+            idx: i,
+            destinatario_id: j.row.id ?? key,
+            numero: j.to,
+            motivo: !check.ok ? 'error_check' : 'no_tiene_whatsapp'
+          });
+
+          // limpiar bandera sending (no se envió)
+          try {
+            const liveSkip = loadJSON(filePath) || data;
+            liveSkip.progreso = liveSkip.progreso || {};
+            const prevS = liveSkip.progreso[key] || {};
+            liveSkip.progreso[key] = {
+              ...prevS,
+              sending: false,
+              sent: false,
+              skipped_at: new Date().toISOString(),
+              skip_reason: (!check.ok ? 'error_check' : 'no_tiene_whatsapp')
+            };
+            saveJSON(filePath, liveSkip);
+            data = liveSkip;
+          } catch (e) {}
+
+          // marcar como "sent" en progreso? (si quieres NO reintentar nunca)
+          // aquí lo dejamos NO enviado para que puedas reintentar si luego cambias lógica.
+          continue;
+        }
+
+        // ==================== ✅ 2) ENVIAR MENSAJE (solo si exists=true) ====================
+        const body = { sessionId, to: j.to, message: msgForThisRecipient };
+        dbg('POST send-message → url:', sendUrl, 'body:', pretty(body));
+
         logAction('envio_mensaje', {
-          fase: 'error',
+          fase: 'antes',
           id_campana: campana.id,
           archivo: filePath,
           idx: i,
-          destinatario_id: j.row.id ?? key,
-          numero: j.to,
-          http_status: st,
-          error_message: e?.message || 'Error envío',
-          error_body: typeof dd === 'string' ? dd.slice(0, 400) : dd
+          destinatario: {
+            id: j.row.id ?? key,
+            numero: j.to,
+            tipo: j.row.tipo,
+            estado_envio: j.row.estado_envio
+          },
+          body
         });
 
-        await postStatus({
-          action: 'envio_mensaje',
-          id_campana: campana.id,
-          destinatario_id: j.row.id,
-          fase: 'error'
-        });
+        try {
+          const resp = await axios.post(sendUrl, body, {
+            timeout: 30000,
+            headers: { 'Content-Type': 'application/json' }
+          });
+
+          dbg('POST send-message ← status:', resp.status, 'resp:', pretty(resp.data));
+
+          // Reporte a existencia.php: enviado_ok
+          await reportExistencia({
+            tipo: 'send',
+            sessionId,
+            numero: j.to,
+            exists: true,
+            sent: true,
+            motivo: 'enviado_ok',
+            extra: { http_status: resp.status, resp: resp.data }
+          });
+
+          logAction('envio_mensaje', {
+            fase: 'exito',
+            id_campana: campana.id,
+            archivo: filePath,
+            idx: i,
+            destinatario_id: j.row.id ?? key,
+            numero: j.to,
+            http_status: resp.status
+          });
+
+          await postStatus({
+            action: 'envio_mensaje',
+            id_campana: campana.id,
+            destinatario_id: j.row.id,
+            fase: 'exito'
+          });
+
+          // guardamos progreso
+          const live = loadJSON(filePath) || data;
+          live.progreso = live.progreso || {};
+          const prev = live.progreso[key] || {};
+          live.progreso[key] = { ...prev, sent: true, sending: false, at: new Date().toISOString() };
+          saveJSON(filePath, live);
+          data = live;
+        } catch (e) {
+          errores++;
+          const st = e?.response?.status;
+          const dd = e?.response?.data;
+
+          dbg('POST send-message ← ERROR status:', st, 'resp:', pretty(dd), 'msg:', e?.message);
+
+          // Reporte a existencia.php: error_envio
+          await reportExistencia({
+            tipo: 'send',
+            sessionId,
+            numero: j.to,
+            exists: true,
+            sent: false,
+            motivo: 'error_envio',
+            extra: { http_status: st || null, error: e?.message || 'Error envío', resp: dd || null }
+          });
+
+          // limpiar bandera sending (falló el envío)
+          try {
+            const liveErr = loadJSON(filePath) || data;
+            liveErr.progreso = liveErr.progreso || {};
+            const prevE = liveErr.progreso[key] || {};
+            liveErr.progreso[key] = {
+              ...prevE,
+              sending: false,
+              sent: false,
+              error_at: new Date().toISOString(),
+              error_message: e?.message || 'Error envío',
+              http_status: st || null
+            };
+            saveJSON(filePath, liveErr);
+            data = liveErr;
+          } catch (e2) {}
+
+          logAction('envio_mensaje', {
+            fase: 'error',
+            id_campana: campana.id,
+            archivo: filePath,
+            idx: i,
+            destinatario_id: j.row.id ?? key,
+            numero: j.to,
+            http_status: st,
+            error_message: e?.message || 'Error envío',
+            error_body: typeof dd === 'string' ? dd.slice(0, 400) : dd
+          });
+
+          await postStatus({
+            action: 'envio_mensaje',
+            id_campana: campana.id,
+            destinatario_id: j.row.id,
+            fase: 'error'
+          });
+        }
+
+        // Intervalo entre envíos
+        if (i + 1 < jobs.length && intervalMs > 0) {
+          await sleep(intervalMs);
+          logAction('envio_mensaje', {
+            fase: 'pausa_intervalo',
+            id_campana: campana.id,
+            archivo: filePath,
+            ms: intervalMs,
+            next_index: i + 1
+          });
+          await postStatus({ action: 'pausa_intervalo', id_campana: campana.id, fase: 'pausa_intervalo' });
+        }
+
+        // Pausa por lote
+        if (i + 1 < jobs.length && pausaCada > 0 && pausaMs > 0 && (i + 1) % pausaCada === 0) {
+          await sleep(pausaMs);
+          logAction('envio_mensaje', {
+            fase: 'pausa_lote',
+            id_campana: campana.id,
+            archivo: filePath,
+            ms: pausaMs,
+            despues_de: i + 1
+          });
+          await postStatus({ action: 'pausa_lote', id_campana: campana.id, fase: 'pausa_lote' });
+        }
       }
 
-      // Intervalo entre envíos
-      if (i + 1 < jobs.length && intervalMs > 0) {
-        await sleep(intervalMs);
-        logAction('envio_mensaje', {
-          fase: 'pausa_intervalo',
-          id_campana: campana.id,
-          archivo: filePath,
-          ms: intervalMs,
-          next_index: i + 1
-        });
-        await postStatus({ action: 'pausa_intervalo', id_campana: campana.id, fase: 'pausa_intervalo' });
+      // Finalizar
+      const enviados = Object.values(data.progreso || {}).filter(p => p && p.sent === true).length;
+
+      await postStatus({
+        action: 'Proceso Finalizado',
+        id_campana: campana.id,
+        enviados,
+        errores
+      });
+
+      const durationMs = Date.now() - startedAt;
+
+      data.estado_campana = 'finalizada';
+      data.errores = errores;
+      saveJSON(filePath, data);
+
+      if (SCHEDULES.has(filePath)) {
+        try { clearTimeout(SCHEDULES.get(filePath)); } catch {}
+        SCHEDULES.delete(filePath);
       }
 
-      // Pausa por lote
-      if (i + 1 < jobs.length && pausaCada > 0 && pausaMs > 0 && (i + 1) % pausaCada === 0) {
-        await sleep(pausaMs);
-        logAction('envio_mensaje', {
-          fase: 'pausa_lote',
-          id_campana: campana.id,
-          archivo: filePath,
-          ms: pausaMs,
-          despues_de: i + 1
-        });
-        await postStatus({ action: 'pausa_lote', id_campana: campana.id, fase: 'pausa_lote' });
+      // Borrar JSON al finalizar
+      let deleted = false;
+      let deleteError = null;
+      try {
+        if (fs.existsSync(filePath)) {
+          fs.unlinkSync(filePath);
+          deleted = true;
+        } else {
+          deleted = true;
+        }
+      } catch (e) {
+        deleteError = e?.message || String(e);
       }
+
+      logAction('Proceso Finalizado', {
+        id_campana: campana.id,
+        archivo: filePath,
+        total_destinatarios: Array.isArray(data.destinatarios) ? data.destinatarios.length : 0,
+        enviados,
+        errores,
+        duracion_ms: durationMs,
+        json_borrado: deleted,
+        delete_error: deleteError
+      });
+
+      info('Finalizada campaña:', campana.id, 'enviados:', enviados, 'errores:', errores, 'ms:', durationMs);
+
+      // Nota: no hacemos IN_FLIGHT.delete aquí; se hace en finally
+    } finally {
+      try { IN_FLIGHT.delete(filePath); } catch {}
+      try { releaseFileLock(filePath); } catch {}
     }
-
-    // Finalizar
-    const enviados = Object.values(data.progreso || {}).filter(p => p && p.sent === true).length;
-
-    await postStatus({
-      action: 'Proceso Finalizado',
-      id_campana: campana.id,
-      enviados,
-      errores
-    });
-
-    const durationMs = Date.now() - startedAt;
-
-    data.estado_campana = 'finalizada';
-    data.errores = errores;
-    saveJSON(filePath, data);
-
-    if (SCHEDULES.has(filePath)) {
-      try { clearTimeout(SCHEDULES.get(filePath)); } catch {}
-      SCHEDULES.delete(filePath);
-    }
-
-    // Borrar JSON al finalizar
-    let deleted = false;
-    let deleteError = null;
-    try {
-      if (fs.existsSync(filePath)) {
-        fs.unlinkSync(filePath);
-        deleted = true;
-      } else {
-        deleted = true;
-      }
-    } catch (e) {
-      deleteError = e?.message || String(e);
-    }
-
-    logAction('Proceso Finalizado', {
-      id_campana: campana.id,
-      archivo: filePath,
-      total_destinatarios: Array.isArray(data.destinatarios) ? data.destinatarios.length : 0,
-      enviados,
-      errores,
-      duracion_ms: durationMs,
-      json_borrado: deleted,
-      delete_error: deleteError
-    });
-
-    info('Finalizada campaña:', campana.id, 'enviados:', enviados, 'errores:', errores, 'ms:', durationMs);
-
-    IN_FLIGHT.delete(filePath);
   }
 
   // ==================== GUARDIA ====================
