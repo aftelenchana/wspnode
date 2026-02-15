@@ -1,5 +1,6 @@
 // whatsapp.js (SIN RESTRICCIONES: TODO entra/sale + LOGS CLARITOS)
-// LOGS: ingreso mensaje + envio/recibo API + envio WA + errores
+// ✅ LOGS SOLO CONSOLA (NO ARCHIVOS)
+// ✅ Multimedia ENTRANTE: NO renombra, NO descarga, NO guarda, NO manda a API
 
 const fs = require('fs');
 const path = require('path');
@@ -12,7 +13,7 @@ const { Boom } = require('@hapi/boom');
 const {
   default: makeWASocket,
   useMultiFileAuthState,
-  downloadMediaMessage,
+  // downloadMediaMessage, // ❌ ya no se usa (multimedia entrante se ignora)
   fetchLatestBaileysVersion,
   jidNormalizedUser,
 } = require('@whiskeysockets/baileys');
@@ -22,20 +23,15 @@ const ffmpeg = require('@ffmpeg-installer/ffmpeg').path;
 
 const FORCE_QR_IN_TERMINAL = process.env.FORCE_QR_IN_TERMINAL === '1';
 
-// ===================== LOGS A ARCHIVO =====================
+// ===================== LOGS SOLO CONSOLA =====================
 const LOG_CONSOLE = process.env.LOG_CONSOLE !== '0';
-const LOG_DIR = process.env.LOG_DIR || path.join(__dirname, 'logs');
-const LOG_MAX_MB = Number(process.env.LOG_MAX_MB || 15);
-const LOG_MAX_BYTES = LOG_MAX_MB * 1024 * 1024;
 
-// ✅ SOLO estos tags se escriben
+// ✅ SOLO estos tags se imprimen
 const LOG_ALLOW = new Set([
   'MSG_IN',
 
   'API_SEND_IN_TEXT',
   'API_RECV_IN_TEXT',
-  'API_SEND_IN_MEDIA',
-  'API_RECV_IN_MEDIA',
 
   'API_SEND_OUT',
   'API_RECV_OUT',
@@ -58,7 +54,6 @@ const LOG_ALLOW = new Set([
 ]);
 
 function ts() { return new Date().toISOString(); }
-function dayStamp() { return new Date().toISOString().slice(0, 10); }
 
 function safeStringify(obj, maxLen = 14000) {
   try {
@@ -82,53 +77,9 @@ function safeStringify(obj, maxLen = 14000) {
   }
 }
 
-function ensureDirSync(dir) {
-  try { fs.mkdirSync(dir, { recursive: true }); } catch {}
-}
-
-function rotateIfNeeded(filePath) {
-  try {
-    if (!fs.existsSync(filePath)) return;
-    const st = fs.statSync(filePath);
-    if (st.size < LOG_MAX_BYTES) return;
-
-    const rotated = `${filePath}.1`;
-    try { fs.unlinkSync(rotated); } catch {}
-    fs.renameSync(filePath, rotated);
-  } catch {}
-}
-
-function appendLine(filePath, line) {
-  try {
-    rotateIfNeeded(filePath);
-    fs.appendFile(filePath, line + '\n', (err) => {
-      if (err && LOG_CONSOLE) console.error(`[${ts()}] [FILE_LOG_ERROR]`, err.message || err);
-    });
-  } catch {}
-}
-
-function getSessionIdFromData(data) {
-  try {
-    if (!data) return null;
-    if (typeof data === 'object' && data.sessionId) return String(data.sessionId);
-  } catch {}
-  return null;
-}
-
-function getLogPaths(sessionId = null) {
-  const d = dayStamp();
-  const general = path.join(LOG_DIR, `whatsapp-${d}.log`);
-  const perSession = sessionId ? path.join(LOG_DIR, `session_${sessionId}-${d}.log`) : null;
-  return { general, perSession };
-}
-
 function writeLog(level, tag, data = null) {
+  if (!LOG_CONSOLE) return;
   if (!LOG_ALLOW.has(tag)) return;
-
-  ensureDirSync(LOG_DIR);
-
-  const sessionId = getSessionIdFromData(data);
-  const { general, perSession } = getLogPaths(sessionId);
 
   const payload = (data !== null)
     ? (typeof data === 'string' ? data : safeStringify(data))
@@ -138,13 +89,8 @@ function writeLog(level, tag, data = null) {
     ? `[${ts()}] [${level}] [${tag}] ${payload}`
     : `[${ts()}] [${level}] [${tag}]`;
 
-  appendLine(general, line);
-  if (perSession) appendLine(perSession, line);
-
-  if (LOG_CONSOLE) {
-    if (level === 'ERROR') console.error(line);
-    else console.log(line);
-  }
+  if (level === 'ERROR') console.error(line);
+  else console.log(line);
 }
 
 function log(tag, data = null) { writeLog('INFO', tag, data); }
@@ -287,8 +233,8 @@ async function createSession(sessionId) {
 
   await ensureDir('./sessions');
   await ensureDir(authPath);
-  await ensureDir('./files');
-  await ensureDir('./logs');
+  await ensureDir('./files'); // ✅ se usa para TTS y descargas por URL del bot
+  // ❌ await ensureDir('./logs');  // quitado: ya no usamos logs a archivo
 
   const { state, saveCreds } = await useMultiFileAuthState(authPath);
 
@@ -316,7 +262,7 @@ async function createSession(sessionId) {
   contactsStore[sessionId] = new Map();
   chatsStore[sessionId] = new Map();
 
-  // store (sin logs)
+  // store
   sock.ev.on('messaging-history.set', ({ chats, contacts }) => {
     try {
       const cMap = contactsStore[sessionId];
@@ -418,7 +364,7 @@ async function createSession(sessionId) {
     } catch {}
   });
 
-  // conexión/QR/reconexión (sin logs)
+  // conexión/QR/reconexión
   sock.ev.on('connection.update', async (update) => {
     try {
       const { connection, qr, lastDisconnect } = update || {};
@@ -460,7 +406,7 @@ async function createSession(sessionId) {
     } catch {}
   });
 
-  // ===================== MENSAJES (SIN FILTROS) =====================
+  // ===================== MENSAJES =====================
   sock.ev.on('messages.upsert', async (m) => {
     const msg = m?.messages?.[0];
     if (!msg || !msg.message) return;
@@ -473,16 +419,26 @@ async function createSession(sessionId) {
     // ============ ENTRANTE ============
     if (!fromMe) {
       let messageContent = '';
-      let fileName = null;
 
+      // TEXTO
       if (msg.message.conversation) messageContent = msg.message.conversation;
       else if (msg.message.text) messageContent = msg.message.text;
       else if (msg.message.extendedTextMessage) messageContent = msg.message.extendedTextMessage.text;
-      else if (msg.message.imageMessage) { fileName = `imagen_${Date.now()}.jpg`; messageContent = '[Imagen recibida]'; }
-      else if (msg.message.documentMessage) { fileName = msg.message.documentMessage.fileName || `documento_${Date.now()}.pdf`; messageContent = '[Documento recibida]'; }
-      else if (msg.message.audioMessage) { fileName = `audio_${Date.now()}.mp3`; messageContent = '[Audio recibido]'; }
-      else if (msg.message.videoMessage) { fileName = `video_${Date.now()}.mp4`; messageContent = '[Video recibido]'; }
-      else if (msg.message.stickerMessage) { fileName = `sticker_${Date.now()}.webp`; messageContent = '[Sticker recibido]'; }
+
+      // MULTIMEDIA (IGNORAR COMPLETAMENTE: no renombra, no guarda, no API)
+      const isIncomingMedia =
+        !!msg.message.imageMessage ||
+        !!msg.message.documentMessage ||
+        !!msg.message.audioMessage ||
+        !!msg.message.videoMessage ||
+        !!msg.message.stickerMessage;
+
+      if (isIncomingMedia) {
+        // Solo para log de ingreso (como tu querías “sin perder estructura”)
+        const msg_preview = `[${msgType}] ignorado (multimedia entrante)`;
+        log('MSG_IN', { sessionId, msgId, remoteJid, msgType, msg_preview });
+        return;
+      }
 
       const msg_in = String(messageContent || '');
       const msg_preview = msg_in.length > 300 ? (msg_in.slice(0, 300) + '...') : msg_in;
@@ -496,56 +452,26 @@ async function createSession(sessionId) {
       try {
         const url = `${CFG.url_sistema}${CFG.endpoint}`;
 
-        // MEDIA
-        if (fileName) {
-          const filesDir = await ensureDir(path.join(__dirname, 'files'));
-          const filePath = path.join(filesDir, fileName);
+        // TEXT (único que va a API)
+        const payload = {
+          sessionId,
+          from: remoteJid,
+          messageContent,
+          user: 'usuario',
+          msgType,
+          msgId,
+        };
 
-          try {
-            const buffer = await downloadMediaMessage(msg, 'buffer');
-            fs.writeFileSync(filePath, buffer);
-          } catch {}
+        log('API_SEND_IN_TEXT', { sessionId, url, payload });
 
-          const payload = {
-            sessionId,
-            from: remoteJid,
-            messageContent: fileName,
-            user: 'usuario',
-            msgType,
-            msgId,
-          };
+        const t0 = Date.now();
+        const response = await api.post(url, payload);
+        const ms = Date.now() - t0;
 
-          log('API_SEND_IN_MEDIA', { sessionId, url, payload });
+        log('API_RECV_IN_TEXT', { sessionId, ms, status: response.status, data: response.data });
 
-          const t0 = Date.now();
-          const response = await api.post(url, payload);
-          const ms = Date.now() - t0;
+        await handleBotReplyAndMedia(sock, replyJid, response.data);
 
-          log('API_RECV_IN_MEDIA', { sessionId, ms, status: response.status, data: response.data });
-
-          await handleBotReplyAndMedia(sock, replyJid, response.data);
-        }
-        // TEXT
-        else {
-          const payload = {
-            sessionId,
-            from: remoteJid,
-            messageContent,
-            user: 'usuario',
-            msgType,
-            msgId,
-          };
-
-          log('API_SEND_IN_TEXT', { sessionId, url, payload });
-
-          const t0 = Date.now();
-          const response = await api.post(url, payload);
-          const ms = Date.now() - t0;
-
-          log('API_RECV_IN_TEXT', { sessionId, ms, status: response.status, data: response.data });
-
-          await handleBotReplyAndMedia(sock, replyJid, response.data);
-        }
       } catch (e) {
         logError('INCOMING_HANDLER_ERROR', {
           sessionId,
@@ -748,7 +674,7 @@ function closeAllSessions() {
 async function loadExistingSessions() {
   const sessionsRoot = await ensureDir('./sessions');
   await ensureDir('./files');
-  await ensureDir('./logs');
+  // ❌ await ensureDir('./logs'); // quitado
 
   const sessionDirs = fs.readdirSync(sessionsRoot)
     .filter(f => fs.statSync(path.join(sessionsRoot, f)).isDirectory());
