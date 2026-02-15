@@ -143,9 +143,88 @@ app.post('/close-all-sessions', (req, res) => {
 
 
 
+// =====================
+// Helpers / lógica común
+// =====================
+async function checkWhatsAppNumber({ sessionId, number }) {
+  if (!sessionId || !number) {
+    return {
+      status: 400,
+      body: { ok: false, message: 'sessionId y number son requeridos' }
+    };
+  }
+
+  // solo dígitos, 8 a 15 (E.164 típico)
+  if (!/^\d{8,15}$/.test(String(number))) {
+    return {
+      status: 422,
+      body: {
+        ok: false,
+        message: 'Formato inválido. Use solo dígitos, ej: 593998855160'
+      }
+    };
+  }
+
+  const sock = sessions[sessionId];
+  if (!sock) {
+    return {
+      status: 404,
+      body: { ok: false, message: 'Sesión no encontrada' }
+    };
+  }
+
+  // Verifica que la sesión esté activa (QR escaneado)
+  const sessionDirPath = path.join(__dirname, 'sessions', sessionId);
+  if (!fs.existsSync(sessionDirPath) || !fs.readdirSync(sessionDirPath).length) {
+    return {
+      status: 400,
+      body: { ok: false, message: 'La sesión no está activa (QR no escaneado)' }
+    };
+  }
+
+  const jid = `${number}@s.whatsapp.net`;
+
+  // Consulta real a WhatsApp
+  const result = await sock.onWhatsApp(jid);
+
+  const exists = Array.isArray(result) && result[0]?.exists === true;
+
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      number: String(number),
+      jid,
+      exists
+    }
+  };
+}
+
+// =====================
+// Endpoint: /check-whatsapp
+// =====================
+app.post('/check-whatsapp', async (req, res) => {
+  try {
+    const { sessionId, number } = req.body || {};
+
+    const out = await checkWhatsAppNumber({ sessionId, number });
+    return res.status(out.status).json(out.body);
+
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      message: 'Error al verificar número',
+      error: err?.message || String(err)
+    });
+  }
+});
+
+// =====================
+// Endpoint: /check-session
+// =====================
 app.post('/check-session', async (req, res) => {
   try {
-    const { sessionId } = req.body;
+    const { sessionId } = req.body || {};
     if (!sessionId) {
       return res.status(400).json({ error: 'El sessionId es requerido.' });
     }
@@ -169,45 +248,27 @@ app.post('/check-session', async (req, res) => {
       });
     }
 
-    // ✅ Si está activa, hacemos la validación extra (check-whatsapp)
-    const numberEstatico = '593998855160'; // <-- dato estático (como pediste)
+    // ✅ Validación extra sin fetch (mismo servidor)
+    const numberEstatico = '593998855160';
 
     let validacionExtra = null;
     let validacionExtraError = null;
 
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 8000); // 8s timeout
+      const out = await checkWhatsAppNumber({ sessionId, number: numberEstatico });
 
-      const resp = await fetch('https://wsp.whatsflash.app/check-whatsapp', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal: controller.signal,
-        body: JSON.stringify({
-          sessionId,
-          number: numberEstatico
-        })
-      });
-
-      clearTimeout(timeout);
-
-      // Si la API responde algo raro, lo controlamos
-      const data = await resp.json().catch(() => null);
-
-      if (resp.ok && data && typeof data.exists === 'boolean') {
-        validacionExtra = data.exists; // true/false
+      // Solo tomamos exists si fue OK real
+      if (out.status === 200 && out.body && typeof out.body.exists === 'boolean') {
+        validacionExtra = out.body.exists;
       } else {
         validacionExtra = null;
-        validacionExtraError = data?.error || `Respuesta inválida de check-whatsapp (status ${resp.status})`;
+        validacionExtraError = out.body?.message || `Error validando (status ${out.status})`;
       }
     } catch (e) {
       validacionExtra = null;
-      validacionExtraError = e?.name === 'AbortError'
-        ? 'Timeout consultando check-whatsapp'
-        : (e?.message || 'Error consultando check-whatsapp');
+      validacionExtraError = e?.message || 'Error consultando checkWhatsAppNumber';
     }
 
-    // ✅ Respuesta final (mantiene tu formato y agrega validacionExtra)
     const respuesta = {
       sessionId,
       status: 'activa',
@@ -215,7 +276,6 @@ app.post('/check-session', async (req, res) => {
       validacionExtra
     };
 
-    // opcional: si quieres ver el porqué falló cuando sea null
     if (validacionExtra === null && validacionExtraError) {
       respuesta.validacionExtraError = validacionExtraError;
     }
@@ -229,6 +289,7 @@ app.post('/check-session', async (req, res) => {
     });
   }
 });
+
 
 
 // ===== Envíos y consultas =====
@@ -488,64 +549,6 @@ app.post('/campana/estado', (req, res) => {
 });
 
 
-app.post('/check-whatsapp', async (req, res) => {
-  try {
-    const { sessionId, number } = req.body || {};
-
-    if (!sessionId || !number) {
-      return res.status(400).json({
-        ok: false,
-        message: 'sessionId y number son requeridos'
-      });
-    }
-
-    // número esperado: 593xxxxxxxxx (solo dígitos)
-    if (!/^\d{8,15}$/.test(number)) {
-      return res.status(422).json({
-        ok: false,
-        message: 'Formato inválido. Use solo dígitos, ej: 593998855160'
-      });
-    }
-
-    const sock = sessions[sessionId];
-    if (!sock) {
-      return res.status(404).json({
-        ok: false,
-        message: 'Sesión no encontrada'
-      });
-    }
-
-    // Verifica que la sesión esté activa (QR escaneado)
-    const sessionDirPath = path.join(__dirname, 'sessions', sessionId);
-    if (!fs.existsSync(sessionDirPath) || !fs.readdirSync(sessionDirPath).length) {
-      return res.status(400).json({
-        ok: false,
-        message: 'La sesión no está activa (QR no escaneado)'
-      });
-    }
-
-    const jid = `${number}@s.whatsapp.net`;
-
-    // 🔥 CONSULTA REAL A WHATSAPP
-    const result = await sock.onWhatsApp(jid);
-
-    const exists = Array.isArray(result) && result[0]?.exists === true;
-
-    return res.json({
-      ok: true,
-      number,
-      jid,
-      exists
-    });
-
-  } catch (err) {
-    return res.status(500).json({
-      ok: false,
-      message: 'Error al verificar número',
-      error: err?.message || String(err)
-    });
-  }
-});
 
 
 // ===== Estáticos =====
