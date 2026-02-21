@@ -4,7 +4,7 @@
 const cors = require('cors');
 const express = require('express');
 const app = express();
-const PORT = process.env.PORT || 50002;
+const PORT = process.env.PORT || 3000;
 
 const fs = require('fs');
 const path = require('path');
@@ -17,9 +17,6 @@ const stream = require('stream');
 const url_sistema = 'https://wsp.guibis.com';
 const endpoint = '/dev/wspguibis/system_gtp';
 const endpoint_salida = '/dev/wspguibis/system_gtp_salientes';
-
-const url_sistema_node = 'https://wsp.whatsflash.app';
-const CHECK_NUMBER = '593998855160'; // FIJO, NO SE PIDE AL CLIENTE
 
 // 1) importar módulos propios
 const registerEnvioMasivo = require('./envio_masivo');
@@ -139,9 +136,6 @@ app.post('/close-all-sessions', (req, res) => {
   closeAllSessions();
   res.json({ message: 'Todas las sesiones cerradas y archivos eliminados correctamente.' });
 });
-
-
-
 
 // =====================
 // Helpers / lógica común

@@ -3,7 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
-const { randomInt } = require('crypto'); // ← para aleatoriedad robusta
+const { randomInt } = require('crypto'); // aleatoriedad robusta
 
 // ==================== DEBUG / LOGGING ====================
 const DEBUG = process.env.ENVIO_DEBUG !== '0'; // por defecto ON (set ENVIO_DEBUG=0 para silenciar)
@@ -46,14 +46,11 @@ const SCHEDULES = new Map();
 const IN_FLIGHT = new Set();
 
 // ==================== LOCK por archivo (anti-doble-proceso) ====================
-// Nota: esto evita dobles envíos cuando una campaña diferida se dispara por timeout y por guardia al mismo tiempo.
-// El lock es a nivel filesystem, así que incluso si hay re-entradas o dos disparadores, solo uno procesa.
 function lockPathFor(filePath) { return `${filePath}.lock`; }
 
 function acquireFileLock(filePath) {
   const lp = lockPathFor(filePath);
   try {
-    // si el JSON no existe, no tiene sentido lockear
     if (!fs.existsSync(filePath)) return { ok: false, reason: 'no_json' };
 
     // openSync con 'wx' falla si ya existe
@@ -63,7 +60,6 @@ function acquireFileLock(filePath) {
     try { fs.closeSync(fd); } catch {}
     return { ok: true, lockPath: lp };
   } catch (e) {
-    // lock ya existe
     if (e && (e.code === 'EEXIST' || e.code === 'EACCES')) return { ok: false, reason: 'locked', lockPath: lp };
     return { ok: false, reason: e?.code || e?.message || 'lock_error', lockPath: lp };
   }
@@ -91,8 +87,6 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
     statusEndpoint: `${urlSistemaBase}/dev/api/estado`,
     varsApiEndpoint: `${urlSistemaBase}/dev/api/variables_globales`, // POST
     existenciaEndpoint: `${urlSistemaBase}/dev/api/existencia`,      // ✅ POST JSON (NO form)
-    // endpoint del server WhatsApp para verificar existencia:
-    // NO lo ponemos como cfg.checkWaEndpoint (como pediste), lo usamos directo abajo.
   };
 
   const CAMPANAS_DIR = cfg.baseDir;
@@ -441,7 +435,8 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
     }
   }
 
-  // ==================== ENDPOINT ====================
+  // ==================== ENDPOINTS ====================
+  // ✅ Compat: si tu front usa /masivo/preview para tiempo real, aquí guardamos y arrancamos
   app.post('/masivo/preview', async (req, res) => {
     try {
       let payload = extractPayload(req);
@@ -477,12 +472,12 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
         });
       }
 
-      // Guardar snapshot
       const filePath = campaignPathByMode(modo, id);
+
       const snapshot = {
         ...payload,
-        estado_campana: 'pendiente', // pendiente | en_proceso | finalizada | error | cancelado
-        progreso: {},                // { [numero_normalizado]: { sent: true, at: ISO, ... } }
+        estado_campana: 'pendiente',
+        progreso: payload.progreso && typeof payload.progreso === 'object' ? payload.progreso : {},
         created_at: new Date().toISOString()
       };
       saveJSON(filePath, snapshot);
@@ -495,7 +490,14 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
         preview_only: true
       });
 
-      res.json({ ok: true, message: 'Preview guardado.', filePath });
+      // 🔥 Si es realtime: arranca ya (compat con tu flujo anterior)
+      if (modo === 'en_tiempo_real') {
+        processCampaignFile(filePath, { modeLabel: 'en_tiempo_real' }).catch(error);
+      } else {
+        scheduleDiferido(filePath);
+      }
+
+      res.json({ ok: true, message: 'Preview guardado (y ejecutado si es tiempo real).', filePath });
 
     } catch (e) {
       error('Error /masivo/preview', e?.message || e);
@@ -578,7 +580,6 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
       data.estado_campana = 'cancelado';
       saveJSON(filePath, data);
 
-      // limpiar timeout si estaba programada
       if (SCHEDULES.has(filePath)) {
         try { clearTimeout(SCHEDULES.get(filePath)); } catch {}
         SCHEDULES.delete(filePath);
@@ -594,23 +595,65 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
   });
 
   // ==================== WHATSAPP CHECK / REPORT EXISTENCIA ====================
-  async function checkWhatsAppNumber(baseUrl, sessionId, numero) {
-    const url = `${baseUrl}/check-number`;
-    const body = { sessionId, number: numero };
-    try {
-      dbg('POST check-number → url:', url, 'body:', pretty(body));
-      const r = await axios.post(url, body, { timeout: 15000, headers: { 'Content-Type': 'application/json' } });
-      dbg('POST check-number ← status:', r.status, 'resp:', pretty(r.data));
 
-      // se espera algo tipo { exists: true/false }
-      const exists = (typeof r.data?.exists === 'boolean') ? r.data.exists : (typeof r.data === 'boolean' ? r.data : null);
-      return { ok: true, exists, raw: r.data };
-    } catch (e) {
-      const st = e?.response?.status;
-      const data = e?.response?.data;
-      warn('POST check-number ERROR status:', st, 'resp:', pretty(data), 'msg:', e?.message);
-      return { ok: false, exists: null, error: e?.message || 'error_check', raw: data };
+  // ✅ TU ENDPOINT REAL ES /check-whatsapp
+  // - Le mandas: { sessionId, number }
+  // - Debe devolver algo como: { ok: true, exists: true/false } (o similar)
+  async function checkWhatsAppNumber(baseUrl, sessionId, numero) {
+    // probamos primero tu endpoint real; y dejamos fallbacks por si cambias rutas
+    const endpoints = [
+      '/check-whatsapp',
+      '/check-number',
+      '/checkNumber',
+      '/check_number',
+      '/api/check-whatsapp',
+      '/api/check-number'
+    ];
+
+    const body = { sessionId, number: numero };
+
+    for (const ep of endpoints) {
+      const url = `${baseUrl}${ep}`;
+      try {
+        dbg('POST check-whatsapp → url:', url, 'body:', pretty(body));
+        const r = await axios.post(url, body, {
+          timeout: 15000,
+          headers: { 'Content-Type': 'application/json' }
+        });
+        dbg('POST check-whatsapp ← status:', r.status, 'resp:', pretty(r.data));
+
+        // Normalizamos respuesta: existen varias formas comunes
+        // 1) { ok:true, exists:true }
+        // 2) { exists:true }
+        // 3) true/false
+        // 4) { ok:true, data:{ exists:true } } etc.
+        let exists = null;
+        if (typeof r.data?.exists === 'boolean') exists = r.data.exists;
+        else if (typeof r.data === 'boolean') exists = r.data;
+        else if (typeof r.data?.data?.exists === 'boolean') exists = r.data.data.exists;
+
+        // Si el endpoint responde pero no manda exists, lo marcamos como "desconocido"
+        // (la lógica de envío abajo solo envía si exists === true)
+        return { ok: true, exists, raw: r.data, used: ep };
+      } catch (e) {
+        const st = e?.response?.status;
+        const data = e?.response?.data;
+        const msg = e?.message || '';
+
+        // Si es 404, probamos el siguiente endpoint
+        if (st === 404) {
+          dbg('check endpoint 404 en', ep, '→ probando otro');
+          continue;
+        }
+
+        warn('POST check-whatsapp ERROR', 'ep:', ep, 'status:', st, 'resp:', pretty(data), 'msg:', msg);
+        return { ok: false, exists: null, error: msg, raw: data, used: ep };
+      }
     }
+
+    // Ninguno existe => devolvemos ok=false (y tu lógica hará skip por seguridad)
+    warn('No se encontró endpoint de verificación (check-whatsapp/check-number).');
+    return { ok: false, exists: null, error: 'NoCheckEndpoint', raw: null, used: 'none' };
   }
 
   async function reportExistencia(payload) {
@@ -626,7 +669,7 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
 
   // ==================== PROCESADOR ====================
   async function processCampaignFile(filePath, { modeLabel }) {
-    // 🔒 Lock filesystem (anti doble disparo)
+    // 🔒 Lock filesystem
     const lock = acquireFileLock(filePath);
     if (!lock.ok) {
       const cid = loadJSON(filePath)?.campana?.id || 0;
@@ -636,7 +679,7 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
       return;
     }
 
-    // Evitar dobles ejecuciones en memoria (misma instancia)
+    // Evitar dobles ejecuciones en memoria
     if (IN_FLIGHT.has(filePath)) {
       const cid = loadJSON(filePath)?.campana?.id || 0;
       logAction('envio_mensaje', { fase: 'skip_duplicado', archivo: filePath, motivo: 'IN_FLIGHT' });
@@ -658,7 +701,7 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
         return;
       }
 
-      // 🔒 Check 0: si está cancelada, no arrancar
+      // 🔒 Check 0: cancelado
       if (String(data.estado_campana || '').toLowerCase() === 'cancelado') {
         info('Campaña en estado "cancelado". No se procesa.', filePath);
         await postStatus({ action: 'cancelado', id_campana: data.campana.id, fase: 'inicio' });
@@ -683,7 +726,7 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
       const pausaCada = Math.max(0, parseInt(campana.mensajes_para_pausa, 10) || 0);
       const pausaMs   = toMs(String(campana.tiempo_para_cantidad || '').trim());
 
-      // Diferido: respeta hora exacta si guardia disparó antes (usando hora de Guayaquil)
+      // Diferido: respeta hora exacta
       if (String(modeLabel).toLowerCase() === 'diferido') {
         const when = parseLocalDateTime(campana.fecha_hora_envio);
         const delayToStart = Math.max(0, when.getTime() - Date.now());
@@ -693,7 +736,7 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
         }
       }
 
-      // Preparar reemplazos de tokens variables_globales
+      // Tokens variables_globales
       const tokenReplacer = await prepareTokenReplacer(campana.mensaje);
 
       logAction('inicio', {
@@ -718,34 +761,33 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
 
       const jobs = data.destinatarios.map((d) => {
         const parts = String(d.numero || '').split('-'); // ["5939...", "Alex", "mail", ...]
-        const toNumber = (parts[0] || '').trim();       // 👈 número CRUDO como mandas (5939988...)
+        const toNumber = (parts[0] || '').trim();       // número crudo
         return { row: d, to: toNumber, parts };
       }).filter(j => j.to);
 
       for (let i = 0; i < jobs.length; i++) {
-        // 🔒 Check 1: justo antes de enviar a cada destinatario
+        // 🔒 Check 1: antes de enviar
         const latest = loadJSON(filePath) || data;
         if (String(latest.estado_campana || '').toLowerCase() === 'cancelado') {
-          info('Cancelado detectado antes de enviar el siguiente mensaje. Se detiene el proceso.', filePath);
+          info('Cancelado detectado antes de enviar el siguiente mensaje. Se detiene.', filePath);
           await postStatus({ action: 'cancelado', id_campana: latest.campana.id, fase: 'antes_de_envio' });
           return;
         }
 
         const j = jobs[i];
 
-        // ✅ Dedupe por número (no por id) para evitar dobles envíos si el mismo número aparece con IDs distintos
+        // dedupe por número
         const rowId = (j.row && (j.row.id !== undefined && j.row.id !== null)) ? j.row.id : null;
         const key = normalizeNumber(j.to);
 
-        const prog = (latest.progreso && latest.progreso[key]) || data.progreso[key] || {};
+        const prog = (latest.progreso && latest.progreso[key]) || data.progreso?.[key] || {};
 
-        // si ya está enviado o alguien lo está enviando, saltar
         if (prog.sent === true || prog.sending === true) {
           dbg('skip ya procesado', key, { sent: !!prog.sent, sending: !!prog.sending });
           continue;
         }
 
-        // 🔒 Marcar "sending" ANTES de check/envío para evitar carreras (especialmente en diferido)
+        // marcar sending antes de check/envío
         try {
           const live0 = loadJSON(filePath) || data;
           live0.progreso = live0.progreso || {};
@@ -764,16 +806,16 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
           warn('No se pudo marcar sending (continúo igual):', e?.message || e);
         }
 
-        // Mensaje por destinatario (respeta template exacto)
+        // Mensaje por destinatario
         const messageTemplate = String(campana.mensaje);
         const replaceParams   = makeParamReplacerFromParts(j.parts);
         const withParams      = replaceParams(messageTemplate);
         const msgForThisRecipient = tokenReplacer.replaceWithRandom(withParams);
 
-        // ==================== ✅ 1) CHECK EXISTENCIA WHATSAPP ====================
+        // ==================== ✅ 1) CHECK EXISTENCIA WHATSAPP (usa /check-whatsapp) ====================
         const check = await checkWhatsAppNumber(baseUrl, sessionId, j.to);
 
-        // Reporte a existencia.php SIEMPRE (exista o no)
+        // Reporte SIEMPRE
         await reportExistencia({
           tipo: 'check',
           sessionId,
@@ -786,11 +828,12 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
           extra: {
             check_ok: check.ok,
             check_error: check.error || null,
-            check_raw: check.raw || null
+            check_raw: check.raw || null,
+            check_used: check.used || null
           }
         });
 
-        // Si NO existe, NO enviamos
+        // Si NO existe (o no se pudo verificar), NO enviamos (tu regla original)
         if (!check.ok || check.exists !== true) {
           logAction('envio_mensaje', {
             fase: 'skip_no_whatsapp',
@@ -802,7 +845,7 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
             motivo: !check.ok ? 'error_check' : 'no_tiene_whatsapp'
           });
 
-          // limpiar bandera sending (no se envió)
+          // limpiar sending
           try {
             const liveSkip = loadJSON(filePath) || data;
             liveSkip.progreso = liveSkip.progreso || {};
@@ -818,12 +861,10 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
             data = liveSkip;
           } catch (e) {}
 
-          // marcar como "sent" en progreso? (si quieres NO reintentar nunca)
-          // aquí lo dejamos NO enviado para que puedas reintentar si luego cambias lógica.
           continue;
         }
 
-        // ==================== ✅ 2) ENVIAR MENSAJE (solo si exists=true) ====================
+        // ==================== ✅ 2) ENVIAR MENSAJE ====================
         const body = { sessionId, to: j.to, message: msgForThisRecipient };
         dbg('POST send-message → url:', sendUrl, 'body:', pretty(body));
 
@@ -849,7 +890,7 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
 
           dbg('POST send-message ← status:', resp.status, 'resp:', pretty(resp.data));
 
-          // Reporte a existencia.php: enviado_ok
+          // Reporte: enviado_ok
           await reportExistencia({
             tipo: 'send',
             sessionId,
@@ -877,7 +918,7 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
             fase: 'exito'
           });
 
-          // guardamos progreso
+          // progreso
           const live = loadJSON(filePath) || data;
           live.progreso = live.progreso || {};
           const prev = live.progreso[key] || {};
@@ -891,7 +932,7 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
 
           dbg('POST send-message ← ERROR status:', st, 'resp:', pretty(dd), 'msg:', e?.message);
 
-          // Reporte a existencia.php: error_envio
+          // Reporte: error_envio
           await reportExistencia({
             tipo: 'send',
             sessionId,
@@ -902,7 +943,7 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
             extra: { http_status: st || null, error: e?.message || 'Error envío', resp: dd || null }
           });
 
-          // limpiar bandera sending (falló el envío)
+          // limpiar sending
           try {
             const liveErr = loadJSON(filePath) || data;
             liveErr.progreso = liveErr.progreso || {};
@@ -939,7 +980,7 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
           });
         }
 
-        // Intervalo entre envíos
+        // Intervalo
         if (i + 1 < jobs.length && intervalMs > 0) {
           await sleep(intervalMs);
           logAction('envio_mensaje', {
@@ -1014,7 +1055,6 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
 
       info('Finalizada campaña:', campana.id, 'enviados:', enviados, 'errores:', errores, 'ms:', durationMs);
 
-      // Nota: no hacemos IN_FLIGHT.delete aquí; se hace en finally
     } finally {
       try { IN_FLIGHT.delete(filePath); } catch {}
       try { releaseFileLock(filePath); } catch {}
