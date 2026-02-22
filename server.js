@@ -20,6 +20,23 @@ const endpoint_salida = '/dev/wspguibis/system_gtp_salientes';
 
 // 1) importar módulos propios
 const registerEnvioMasivo = require('./envio_masivo');
+
+const envioCore = require('./envio_masivo.core');
+const makeEnvioMasivoServices = require('./envio_masivo.services');
+
+// Reutilizamos el motor de variables globales (##TOKEN## y #ID#)
+const envioServices = makeEnvioMasivoServices({
+  cfg: {
+    // el endpoint ya existe en tu sistema
+    varsApiEndpoint: `${url_sistema}/dev/api/variables_globales`,
+
+    // estos quedan por compatibilidad (no son obligatorios para /send-message)
+    statusEndpoint: `${url_sistema}/dev/api/estado`,
+    existenciaEndpoint: `${url_sistema}/dev/api/existencia`
+  },
+  core: envioCore
+});
+
 const {
   initWhatsapp,
   createSession,
@@ -287,40 +304,94 @@ app.post('/check-session', async (req, res) => {
 
 
 // ===== Envíos y consultas =====
+// ===== Envíos y consultas =====
 app.post('/send-message', async (req, res) => {
-  const { sessionId, to, message } = req.body;
+  let { sessionId, to, message, campana, params } = req.body || {};
+
   if (!sessionId || !to || !message) {
-    return res.status(400).json({ error: true, message: 'sessionId, to y message son requeridos.' });
+    return res.status(400).json({
+      error: true,
+      message: 'sessionId, to y message son requeridos.'
+    });
   }
 
   const session = sessions[sessionId];
-  if (!session) return res.status(404).json({ error: 'Sesión no encontrada en la memoria.' });
+  if (!session) {
+    return res.status(404).json({ error: 'Sesión no encontrada en la memoria.' });
+  }
 
   try {
+    // ===== Validar sesión activa =====
     const sessionDirPath = path.join(__dirname, 'sessions', sessionId);
-    if (!fs.existsSync(sessionDirPath)) return res.status(404).json({ error: 'Sesión no encontrada en la carpeta de sesiones.' });
-    const filesInSessionDir = fs.readdirSync(sessionDirPath);
-    if (!filesInSessionDir.length) return res.status(400).json({ error: 'La sesión no ha sido completada (no se ha escaneado el QR).' });
+    if (!fs.existsSync(sessionDirPath)) {
+      return res.status(404).json({ error: 'Sesión no encontrada en la carpeta de sesiones.' });
+    }
 
+    const filesInSessionDir = fs.readdirSync(sessionDirPath);
+    if (!filesInSessionDir.length) {
+      return res.status(400).json({
+        error: 'La sesión no ha sido completada (no se ha escaneado el QR).'
+      });
+    }
+
+    // ===== Asegurar carpeta files =====
+    const filesDir = path.join(__dirname, 'files');
+    if (!fs.existsSync(filesDir)) {
+      fs.mkdirSync(filesDir, { recursive: true });
+    }
+
+    // =========================================================
+    // ✅ NUEVO: Reemplazo de variables globales (##TOKEN##, #ID#)
+    // =========================================================
+    // campana es opcional (si quieres pasar iduser/empresa para variables_globales)
+    // params es opcional (para ##param1##, ##param2##, etc.)
+    let messageFinal = String(message);
+
+    // 1) ##paramN## (opcional)
+    if (Array.isArray(params) && params.length) {
+      const replaceParams = envioServices.makeParamReplacerFromParts(params);
+      messageFinal = replaceParams(messageFinal);
+    }
+
+    // 2) ##TOKEN## y #ID# (consulta al endpoint variables_globales)
+    try {
+      const tokenReplacer = await envioServices.prepareTokenReplacer(messageFinal, campana || null);
+      messageFinal = tokenReplacer.replaceWithRandom(messageFinal);
+    } catch (e) {
+      console.warn('[send-message] Error reemplazando variables globales:', e?.message || e);
+      // Si falla el reemplazo, continuamos con el mensaje original/parametrizado
+    }
+
+    // =========================================================
+    // ✅ TU LÓGICA ORIGINAL (archivos + caption)
+    // =========================================================
     const urlRegex = /(https?:\/\/[^\s]+\.(jpg|jpeg|png|gif|pdf|mp4|docx|xlsx|zip|xml))/ig;
-    const urlMatches = message.match(urlRegex);
-    const textWithoutUrls = message.replace(urlRegex, '').trim();
+    const urlMatches = messageFinal.match(urlRegex);
+    const textWithoutUrls = messageFinal.replace(urlRegex, '').trim();
 
     let textUsedAsCaption = false;
 
     if (urlMatches && urlMatches.length) {
       for (const fileUrl of urlMatches) {
-        const fileName = path.basename(fileUrl);
-        const filePath = path.join(__dirname, 'files', fileName);
+        const fileName = path.basename(fileUrl.split('?')[0]); // soporta URLs con querystring
+        const filePath = path.join(filesDir, fileName);
 
         if (!fs.existsSync(filePath)) {
-          const response = await axios({ url: fileUrl, method: 'GET', responseType: 'stream' });
+          const response = await axios({
+            url: fileUrl,
+            method: 'GET',
+            responseType: 'stream',
+            timeout: 30000
+          });
+
           const writer = fs.createWriteStream(filePath);
           response.data.pipe(writer);
+
           await new Promise((resolve, reject) => {
             writer.on('finish', resolve);
             writer.on('error', reject);
           });
+
           console.log(`Archivo descargado: ${filePath}`);
         } else {
           console.log(`Archivo ya existe: ${filePath}`);
@@ -335,12 +406,14 @@ app.post('/send-message', async (req, res) => {
             caption: !textUsedAsCaption && textWithoutUrls ? textWithoutUrls : null
           });
           textUsedAsCaption = true;
+
         } else if (mimeType.startsWith('video/')) {
           await session.sendMessage(`${to}@s.whatsapp.net`, {
             video: fileBuffer,
             caption: !textUsedAsCaption && textWithoutUrls ? textWithoutUrls : null
           });
           textUsedAsCaption = true;
+
         } else {
           await session.sendMessage(`${to}@s.whatsapp.net`, {
             document: fileBuffer,
@@ -351,15 +424,32 @@ app.post('/send-message', async (req, res) => {
       }
     }
 
+    // Si no hubo media con caption, enviamos texto normal
     if (!textUsedAsCaption && textWithoutUrls) {
       await session.sendMessage(`${to}@s.whatsapp.net`, { text: textWithoutUrls });
     }
 
-    res.json({ message: 'Mensaje enviado correctamente.' });
+    return res.json({
+      ok: true,
+      message: 'Mensaje enviado correctamente.',
+      // útil para debug cuando uses variables
+      debug: {
+        original: String(message).slice(0, 200),
+        final: String(messageFinal).slice(0, 200),
+        uso_caption: textUsedAsCaption,
+        archivos_detectados: urlMatches ? urlMatches.length : 0
+      }
+    });
+
   } catch (err) {
-    res.status(500).json({ error: true, message: 'Error al enviar el mensaje: ' + err.message });
+    return res.status(500).json({
+      error: true,
+      message: 'Error al enviar el mensaje: ' + (err?.message || String(err))
+    });
   }
 });
+
+
 
 // ====== Store personalizado: contactos y chats (Opción B) ======
 app.post('/get-contacts', (req, res) => {

@@ -1,83 +1,36 @@
 'use strict';
 
-const fs = require('fs');
-const path = require('path');
-const axios = require('axios');
-const { randomInt } = require('crypto'); // aleatoriedad robusta
-
-// ==================== DEBUG / LOGGING ====================
-const DEBUG = process.env.ENVIO_DEBUG !== '0'; // por defecto ON (set ENVIO_DEBUG=0 para silenciar)
-const LOG_PREFIX = '[ENVIO]';
-
-const dbg = (...a) => { if (DEBUG) console.log(LOG_PREFIX, ...a); };
-const info = (...a) => console.log(LOG_PREFIX, ...a);
-const warn = (...a) => console.warn(LOG_PREFIX, ...a);
-const error = (...a) => console.error(LOG_PREFIX, ...a);
-
-const pretty = (obj, max = 1000) => {
-  try {
-    const j = typeof obj === 'string' ? obj : JSON.stringify(obj);
-    return j.length > max ? j.slice(0, max) + '…' : j;
-  } catch (e) {
-    return String(obj);
-  }
-};
-
-// Logger JSON por "acción" (compat)
-function logAction(action, data = {}) {
-  try {
-    const line = { action, at: new Date().toISOString(), ...data };
-    console.log(JSON.stringify(line));
-  } catch (e) {
-    console.log(`[logAction:${action}]`, data);
-  }
-}
-
-// ==================== CONFIG ====================
-const DEFAULTS = {
-  baseDir: path.join(process.cwd(), 'campanas'),
-  guardIntervalMs: 15000
-};
-
-// Zona horaria fija para Ecuador (Guayaquil): UTC-5
-const ECUADOR_TZ_OFFSET_HOURS = -5;
-
-const SCHEDULES = new Map();
-const IN_FLIGHT = new Set();
-
-// ==================== LOCK por archivo (anti-doble-proceso) ====================
-function lockPathFor(filePath) { return `${filePath}.lock`; }
-
-function acquireFileLock(filePath) {
-  const lp = lockPathFor(filePath);
-  try {
-    if (!fs.existsSync(filePath)) return { ok: false, reason: 'no_json' };
-
-    // openSync con 'wx' falla si ya existe
-    const fd = fs.openSync(lp, 'wx');
-    const meta = { pid: process.pid, at: new Date().toISOString(), file: filePath };
-    try { fs.writeFileSync(fd, JSON.stringify(meta, null, 2)); } catch {}
-    try { fs.closeSync(fd); } catch {}
-    return { ok: true, lockPath: lp };
-  } catch (e) {
-    if (e && (e.code === 'EEXIST' || e.code === 'EACCES')) return { ok: false, reason: 'locked', lockPath: lp };
-    return { ok: false, reason: e?.code || e?.message || 'lock_error', lockPath: lp };
-  }
-}
-
-function releaseFileLock(filePath) {
-  const lp = lockPathFor(filePath);
-  try { if (fs.existsSync(lp)) fs.unlinkSync(lp); } catch {}
-}
-
-// ==================== Normalización de número (dedupe) ====================
-function normalizeNumber(n) {
-  const s = String(n || '');
-  const digits = s.replace(/\D+/g, '');
-  return digits || s.trim();
-}
+const core = require('./envio_masivo.core');
+const makeEnvioMasivoServices = require('./envio_masivo.services');
 
 module.exports = function registerEnvioMasivo(app, opts = {}) {
+  const {
+    fs,
+    path,
+    DEFAULTS,
+    SCHEDULES,
+    IN_FLIGHT,
+    dbg,
+    info,
+    warn,
+    error,
+    pretty,
+    logAction,
+    logServerClock,
+    logScheduleDetail,
+    appendRuntimeLog,
+    ensureDir,
+    sleep,
+    toMs,
+    parseLocalDateTime,
+    loadJSON,
+    saveJSON,
+    extractPayload,
+    acquireFileLock,
+    releaseFileLock,
+    normalizeNumber
+  } = core;
+
   // 🟢 Desde server.js
   const urlSistemaBase = opts.urlSistema;
 
@@ -93,8 +46,19 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
   const RT_DIR  = path.join(CAMPANAS_DIR, 'en_tiempo_real');
   const DF_DIR  = path.join(CAMPANAS_DIR, 'diferido');
 
+  const services = makeEnvioMasivoServices({ cfg, core });
+  const {
+    postStatus,
+    prepareTokenReplacer,
+    makeParamReplacerFromParts,
+    preflightSessionOrError,
+    checkWhatsAppNumber,
+    reportExistencia
+  } = services;
+
   // Dump de arranque
   info('INIT envio_masivo');
+  logServerClock('BOOT');
   dbg('cfg:', cfg);
   dbg('CAMPANAS_DIR:', CAMPANAS_DIR);
   dbg('RT_DIR:', RT_DIR);
@@ -106,6 +70,8 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
 
   // Programar diferidos presentes al boot
   loadAndScheduleDiferidosOnBoot();
+  // Procesar en_tiempo_real pendientes (si el servidor se reinició y quedaron JSONs)
+  loadAndTriggerRealtimeOnBoot();
 
   // Guardia única
   if (!global.__ENVIO_MASIVO_GUARD__) {
@@ -116,272 +82,21 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
     dbg('Guardia ya estaba activa; no se duplica.');
   }
 
-  // ==================== HELPERS ====================
-  function ensureDir(d, label) {
-    try {
-      if (!fs.existsSync(d)) {
-        fs.mkdirSync(d, { recursive: true });
-        info('Creada carpeta', label || '', d);
-      } else {
-        dbg('Carpeta OK', label || '', d);
-      }
-      fs.accessSync(d, fs.constants.W_OK | fs.constants.R_OK);
-      dbg('Permisos OK en', d);
-    } catch (e) {
-      error('Error creando/verificando carpeta', d, e.message);
-      throw e;
-    }
-  }
-
-  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-  const toMs = (txt) => {
-    if (!txt || typeof txt !== 'string') return 0;
-    const s = txt.trim().toLowerCase();
-    const m = s.match(/(\d+(?:\.\d+)?)\s*(ms|milisegundos?|s|seg|segundos?|min|minutos?|h|horas?)/i);
-    if (!m) return 0;
-    const val = parseFloat(m[1]); const unit = m[2];
-    if (/^ms|miliseg/i.test(unit)) return val;
-    if (/^(s|seg|segundos?)/i.test(unit)) return val * 1000;
-    if (/^min|minutos?/i.test(unit)) return val * 60 * 1000;
-    if (/^h|horas?/i.test(unit)) return val * 60 * 60 * 1000;
-    return 0;
-  };
-
-  /**
-   * Interpreta una cadena de fecha-hora como HORA DE GUAYAQUIL (UTC-5)
-   */
-  const parseLocalDateTime = (str) => {
-    if (!str) return new Date();
-
-    const clean = String(str)
-      .trim()
-      .replace(' ', 'T')
-      .replace(/\.\d+$/, '');
-
-    const m = clean.match(
-      /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/
-    );
-
-    if (!m) {
-      const dFallback = new Date(clean);
-      return isNaN(dFallback.getTime()) ? new Date() : dFallback;
-    }
-
-    const year  = parseInt(m[1], 10);
-    const month = parseInt(m[2], 10);
-    const day   = parseInt(m[3], 10);
-    const hour  = parseInt(m[4], 10);
-    const min   = parseInt(m[5], 10);
-    const sec   = m[6] ? parseInt(m[6], 10) : 0;
-
-    const utcMs = Date.UTC(
-      year,
-      month - 1,
-      day,
-      hour - ECUADOR_TZ_OFFSET_HOURS, // -(-5) => +5
-      min,
-      sec
-    );
-
-    return new Date(utcMs);
-  };
-
-  const campaignPathByMode = (modo_tiempo, id) => {
-    const folder = (String(modo_tiempo || '').toLowerCase() === 'en_tiempo_real') ? RT_DIR : DF_DIR;
-    return path.join(folder, `${id}.json`);
-  };
-
-  const loadJSON = (p) => {
-    try {
-      const raw = fs.readFileSync(p, 'utf8');
-      return JSON.parse(raw);
-    } catch (e) {
-      dbg('loadJSON falló', p, e.message);
-      return null;
-    }
-  };
-
-  const saveJSON = (p, obj) => {
-    try {
-      fs.writeFileSync(p, JSON.stringify(obj, null, 2), 'utf8');
-      dbg('saveJSON OK', p);
-    } catch (e) {
-      error('saveJSON ERROR', p, e.message);
-      throw e;
-    }
-  };
-
-  // ----------------- Parsers & Logs HTTP -----------------
-  function logHttpFailure(ctx, err) {
-    const st   = err?.response?.status;
-    const data = err?.response?.data;
-    warn(`${ctx} ERROR`, st ?? '', typeof data === 'string' ? (data + '').slice(0, 300) : data, err?.message);
-  }
-
-  // Acepta JSON, x-www-form-urlencoded con "payload", o “una sola key” que ya es el JSON
-  function extractPayload(req) {
-    const b = req.body;
-    if (!b) {
-      dbg('extractPayload: body vacío');
-      return null;
-    }
-
-    if (typeof b === 'object') {
-      // JSON directo
-      if ('ok' in b || 'campana' in b || 'destinatarios' in b) {
-        dbg('extractPayload: JSON directo', Object.keys(b));
-        return b;
-      }
-
-      // urlencoded con campo "payload"
-      if (typeof b.payload === 'string') {
-        try {
-          const parsed = JSON.parse(b.payload);
-          dbg('extractPayload: via payload string (urlencoded)');
-          return parsed;
-        } catch (e) {
-          dbg('extractPayload: payload inválido', e.message);
-        }
-      }
-
-      // Caso clave única estilo PHP: {"{json...}":""}
-      const keys = Object.keys(b);
-      if (keys.length === 1 && keys[0].trim().startsWith('{')) {
-        try {
-          const parsed = JSON.parse(keys[0]);
-          dbg('extractPayload: via key única (PHP)');
-          return parsed;
-        } catch (e) {
-          dbg('extractPayload: key única inválida', e.message);
-        }
-      }
-    }
-
-    // Si llegó como string plano
-    if (typeof b === 'string') {
-      try {
-        const parsed = JSON.parse(b);
-        dbg('extractPayload: string JSON');
-        return parsed;
-      } catch {}
-    }
-
-    dbg('extractPayload: no se pudo interpretar');
-    return null;
-  }
-
-  // ==================== STATUS REPORT ====================
-  async function postStatus(payload) {
-    try {
-      await axios.post(cfg.statusEndpoint, payload, {
-        timeout: 15000,
-        headers: { 'Content-Type': 'application/json' }
-      });
-    } catch (e) {
-      logHttpFailure('postStatus', e);
-    }
-  }
-
-  // ==================== VARIABLES GLOBALES / TOKENS ====================
-  async function fetchVariablesGlobales() {
-    try {
-      const r = await axios.post(cfg.varsApiEndpoint, {}, { timeout: 15000 });
-      return r.data;
-    } catch (e) {
-      logHttpFailure('variables_globales', e);
-      return null;
-    }
-  }
-
-  const TOKEN_REGEX = /##([a-zA-Z0-9_]+)##/g;
-
-  function makeTokenReplacer(vars) {
-    const map = new Map();
-    if (vars && typeof vars === 'object') {
-      for (const [k, v] of Object.entries(vars)) {
-        if (!k) continue;
-        // Permitimos que cada token sea string o array
-        map.set(k, v);
-      }
-    }
-
-    function pickValue(val) {
-      if (Array.isArray(val)) {
-        if (!val.length) return '';
-        return val[randomInt(0, val.length)] ?? '';
-      }
-      if (val === null || val === undefined) return '';
-      return String(val);
-    }
-
-    return {
-      replaceWithRandom(text) {
-        if (!text) return text;
-        return String(text).replace(TOKEN_REGEX, (_m, token) => {
-          if (!map.has(token)) return '';
-          return pickValue(map.get(token));
-        });
-      }
-    };
-  }
-
-  async function prepareTokenReplacer(message) {
-    try {
-      const varsResp = await fetchVariablesGlobales();
-      const vars = varsResp?.variables || varsResp?.data || varsResp || {};
-      const replacer = makeTokenReplacer(vars);
-
-      // Validación liviana
-      const test = replacer.replaceWithRandom(message || '');
-      dbg('Token test (preview):', (test || '').slice(0, 120));
-      return replacer;
-    } catch (e) {
-      warn('prepareTokenReplacer fallback:', e?.message || e);
-      return makeTokenReplacer({});
-    }
-  }
-
-  // ========= Params dinámicos ##paramN## =========
-  const paramTokenRegex = /##param(\d+)##/gi;
-
-  function makeParamReplacerFromParts(parts) {
-    return function replaceParams(msg) {
-      if (!msg) return msg;
-      return String(msg).replace(paramTokenRegex, (_m, nStr) => {
-        const n = parseInt(nStr, 10);
-        if (!Number.isFinite(n) || n < 1) return '';
-        const val = (parts[n - 1] ?? '').toString(); // sin trim
-        return val;
-      });
-    };
-  }
-
-  // ========= Pre-chequeo de sesión para en_tiempo_real =========
-  async function preflightSessionOrError(modo, baseUrl, sessionId) {
-    const isRealtime = String(modo).toLowerCase() === 'en_tiempo_real';
-    if (!baseUrl || !sessionId) {
-      return { ok: !isRealtime, reason: 'Faltan baseUrl/sessionId' };
-    }
-    try {
-      const url = `${baseUrl}/check-session`;
-      const body = { sessionId };
-      dbg('POST check-session → url:', url, 'body:', pretty(body));
-      const r = await axios.post(url, body, { timeout: 8000 });
-      dbg('POST check-session ← status:', r.status, 'resp:', pretty(r.data));
-      return { ok: true, data: r.data };
-    } catch (e) {
-      const st = e?.response?.status;
-      const data = e?.response?.data;
-      warn('POST check-session ERROR status:', st, 'resp:', pretty(data), 'msg:', e?.message);
-      if (isRealtime && st === 404) {
-        return { ok: false, reason: 'SesionNoEncontradaEnMemoria', server: data };
-      }
-      return { ok: !isRealtime, reason: `ErrorPreflight:${st || e.message}`, server: data };
-    }
+  // Guardia para en_tiempo_real (por si el trigger inmediato no corre en tu proceso / cluster)
+  if (!global.__ENVIO_MASIVO_RT_GUARD__) {
+    global.__ENVIO_MASIVO_RT_GUARD__ = setInterval(guardScanRealtime, cfg.rtGuardIntervalMs);
+    logAction('inicio', { nota: 'Guardia realtime activado', intervalo_ms: cfg.rtGuardIntervalMs });
+    info('Guardia realtime activado cada', cfg.rtGuardIntervalMs, 'ms');
+  } else {
+    dbg('Guardia realtime ya estaba activa; no se duplica.');
   }
 
   // ==================== SCHEDULING ====================
+  function campaignPathByMode(modo_tiempo, id) {
+    const folder = (String(modo_tiempo || '').toLowerCase() === 'en_tiempo_real') ? RT_DIR : DF_DIR;
+    return path.join(folder, `${id}.json`);
+  }
+
   function scheduleDiferido(filePath) {
     const data = loadJSON(filePath);
     if (!data || !data.campana) {
@@ -396,6 +111,8 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
     }
 
     const when = parseLocalDateTime(data.campana.fecha_hora_envio);
+    logScheduleDetail('scheduleDiferido', data.campana.fecha_hora_envio, when);
+    appendRuntimeLog(CAMPANAS_DIR, { tag: 'SCHEDULE_DIFERIDO', file: filePath, when_iso: when.toISOString(), fecha_hora_envio: data.campana.fecha_hora_envio });
     const delay = Math.max(0, when.getTime() - Date.now());
 
     const prev = SCHEDULES.get(filePath);
@@ -416,10 +133,11 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
       archivo: filePath,
       modo: 'diferido',
       programada_para: when.toISOString(),
-      solo_programacion: true
+      solo_programacion: true,
+      server_now: new Date().toISOString()
     });
 
-    info('Diferido programado:', path.basename(filePath), 'para', when.toISOString());
+    info('Diferido programado:', path.basename(filePath), 'para', when.toISOString(), '| faltan:', core.msToHuman(delay));
   }
 
   function loadAndScheduleDiferidosOnBoot() {
@@ -435,9 +153,37 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
     }
   }
 
+  function loadAndTriggerRealtimeOnBoot() {
+    try {
+      logServerClock('BOOT:loadAndTriggerRealtimeOnBoot');
+      const files = fs.readdirSync(RT_DIR).filter(f => f.endsWith('.json'));
+      info('Realtime pendientes al boot:', files.length);
+      for (const f of files) {
+        const p = path.join(RT_DIR, f);
+        const data = loadJSON(p);
+        if (!data || !data.campana) continue;
+
+        const estado = String(data.estado_campana || 'pendiente').toLowerCase();
+        if (estado === 'en_proceso' || estado === 'finalizada' || estado === 'cancelado') {
+          dbg('Realtime boot: skip por estado', estado, p);
+          continue;
+        }
+
+        // En realtime SIEMPRE disparamos inmediato (ignoramos fecha_hora_envio)
+        info('Realtime boot: disparo inmediato', { file: path.basename(p), id: data.campana.id, server_now: new Date().toISOString() });
+        processCampaignFile(p, { modeLabel: 'en_tiempo_real' }).catch(error);
+      }
+    } catch (e) {
+      error('Error en loadAndTriggerRealtimeOnBoot:', e?.message || e);
+    }
+  }
+
   // ==================== ENDPOINTS ====================
-  // ✅ Compat: si tu front usa /masivo/preview para tiempo real, aquí guardamos y arrancamos
   app.post('/masivo/preview', async (req, res) => {
+    logServerClock('HTTP /masivo/preview:RECIBIDO');
+    appendRuntimeLog(CAMPANAS_DIR, { tag: 'HTTP_PREVIEW_RECIBIDO', ip: req.ip, ua: req.headers?.['user-agent'] || null });
+    dbg('HTTP headers:', pretty(req.headers, 1200));
+
     try {
       let payload = extractPayload(req);
       if (!payload || typeof payload !== 'object') {
@@ -455,6 +201,21 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
       const modo = String(campana.modo_tiempo || '').toLowerCase();
       if (!['en_tiempo_real', 'diferido'].includes(modo)) {
         return res.status(400).json({ ok: false, message: 'modo_tiempo debe ser "en_tiempo_real" o "diferido".' });
+      }
+
+      info('PREVIEW payload:', {
+        id,
+        modo,
+        destinatarios: destinatarios.length,
+        fecha_hora_envio: campana.fecha_hora_envio || null,
+        intervalo_tiempo: campana.intervalo_tiempo || null
+      });
+
+      if (modo === 'diferido') {
+        const when = parseLocalDateTime(campana.fecha_hora_envio);
+        logScheduleDetail('HTTP /masivo/preview (diferido)', campana.fecha_hora_envio, when);
+      } else {
+        info('HTTP /masivo/preview (realtime) → arranca inmediatamente. server_now=', new Date().toISOString());
       }
 
       const baseUrl = String(campana.url || '').replace(/\/+$/, '');
@@ -478,7 +239,8 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
         ...payload,
         estado_campana: 'pendiente',
         progreso: payload.progreso && typeof payload.progreso === 'object' ? payload.progreso : {},
-        created_at: new Date().toISOString()
+        created_at: new Date().toISOString(),
+        debug_server_received_at: new Date().toISOString()
       };
       saveJSON(filePath, snapshot);
 
@@ -487,12 +249,15 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
         archivo: filePath,
         modo: modo,
         total_destinatarios: destinatarios.length,
-        preview_only: true
+        preview_only: true,
+        server_now: new Date().toISOString()
       });
 
-      // 🔥 Si es realtime: arranca ya (compat con tu flujo anterior)
+      // 🔥 Si es realtime: arranca ya
       if (modo === 'en_tiempo_real') {
-        processCampaignFile(filePath, { modeLabel: 'en_tiempo_real' }).catch(error);
+        info('Realtime: processCampaignFile() disparado YA:', { filePath, server_now: new Date().toISOString() });
+        appendRuntimeLog(CAMPANAS_DIR, { tag: 'REALTIME_TRIGGER_DIRECT', file: filePath, id: campana.id, server_now: new Date().toISOString() });
+        setImmediate(() => processCampaignFile(filePath, { modeLabel: 'en_tiempo_real' }).catch(error));
       } else {
         scheduleDiferido(filePath);
       }
@@ -506,6 +271,10 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
   });
 
   app.post('/masivo/iniciar', async (req, res) => {
+    logServerClock('HTTP /masivo/iniciar:RECIBIDO');
+    appendRuntimeLog(CAMPANAS_DIR, { tag: 'HTTP_INICIAR_RECIBIDO', ip: req.ip, ua: req.headers?.['user-agent'] || null });
+    dbg('HTTP headers:', pretty(req.headers, 1200));
+
     try {
       const payload = extractPayload(req);
       if (!payload || payload.ok !== true || !payload.campana || !Array.isArray(payload.destinatarios)) {
@@ -520,6 +289,21 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
 
       const baseUrl = String(campana.url || '').replace(/\/+$/, '');
       const sessionId = String(campana.key_wsp || '').trim();
+
+      info('INICIAR payload:', {
+        id,
+        modo,
+        destinatarios: payload.destinatarios.length,
+        fecha_hora_envio: campana.fecha_hora_envio || null,
+        intervalo_tiempo: campana.intervalo_tiempo || null
+      });
+
+      if (modo === 'diferido') {
+        const when = parseLocalDateTime(campana.fecha_hora_envio);
+        logScheduleDetail('HTTP /masivo/iniciar (diferido)', campana.fecha_hora_envio, when);
+      } else {
+        info('HTTP /masivo/iniciar (realtime) → arranca inmediatamente. server_now=', new Date().toISOString());
+      }
 
       // Preflight para en_tiempo_real
       const pre = await preflightSessionOrError(modo, baseUrl, sessionId);
@@ -539,7 +323,8 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
         ...payload,
         estado_campana: 'pendiente',
         progreso: payload.progreso && typeof payload.progreso === 'object' ? payload.progreso : {},
-        created_at: new Date().toISOString()
+        created_at: new Date().toISOString(),
+        debug_server_received_at: new Date().toISOString()
       };
       saveJSON(filePath, snapshot);
 
@@ -548,11 +333,14 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
         archivo: filePath,
         modo: modo,
         total_destinatarios: payload.destinatarios.length,
-        iniciar: true
+        iniciar: true,
+        server_now: new Date().toISOString()
       });
 
       if (modo === 'en_tiempo_real') {
-        processCampaignFile(filePath, { modeLabel: 'en_tiempo_real' }).catch(error);
+        info('Realtime: processCampaignFile() disparado YA:', { filePath, server_now: new Date().toISOString() });
+        appendRuntimeLog(CAMPANAS_DIR, { tag: 'REALTIME_TRIGGER_DIRECT', file: filePath, id: campana.id, server_now: new Date().toISOString() });
+        setImmediate(() => processCampaignFile(filePath, { modeLabel: 'en_tiempo_real' }).catch(error));
       } else {
         scheduleDiferido(filePath);
       }
@@ -566,6 +354,8 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
   });
 
   app.post('/masivo/cancelar', (req, res) => {
+    logServerClock('HTTP /masivo/cancelar:RECIBIDO');
+
     try {
       const body = req.body || {};
       const id = String(body.id_campana || body.id || '').trim();
@@ -585,7 +375,7 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
         SCHEDULES.delete(filePath);
       }
 
-      logAction('cancelar', { id_campana: data.campana.id, archivo: filePath, modo });
+      logAction('cancelar', { id_campana: data.campana.id, archivo: filePath, modo, server_now: new Date().toISOString() });
 
       res.json({ ok: true, message: 'Campaña cancelada', filePath });
     } catch (e) {
@@ -594,103 +384,35 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
     }
   });
 
-  // ==================== WHATSAPP CHECK / REPORT EXISTENCIA ====================
-
-  // ✅ TU ENDPOINT REAL ES /check-whatsapp
-  // - Le mandas: { sessionId, number }
-  // - Debe devolver algo como: { ok: true, exists: true/false } (o similar)
-  async function checkWhatsAppNumber(baseUrl, sessionId, numero) {
-    // probamos primero tu endpoint real; y dejamos fallbacks por si cambias rutas
-    const endpoints = [
-      '/check-whatsapp',
-      '/check-number',
-      '/checkNumber',
-      '/check_number',
-      '/api/check-whatsapp',
-      '/api/check-number'
-    ];
-
-    const body = { sessionId, number: numero };
-
-    for (const ep of endpoints) {
-      const url = `${baseUrl}${ep}`;
-      try {
-        dbg('POST check-whatsapp → url:', url, 'body:', pretty(body));
-        const r = await axios.post(url, body, {
-          timeout: 15000,
-          headers: { 'Content-Type': 'application/json' }
-        });
-        dbg('POST check-whatsapp ← status:', r.status, 'resp:', pretty(r.data));
-
-        // Normalizamos respuesta: existen varias formas comunes
-        // 1) { ok:true, exists:true }
-        // 2) { exists:true }
-        // 3) true/false
-        // 4) { ok:true, data:{ exists:true } } etc.
-        let exists = null;
-        if (typeof r.data?.exists === 'boolean') exists = r.data.exists;
-        else if (typeof r.data === 'boolean') exists = r.data;
-        else if (typeof r.data?.data?.exists === 'boolean') exists = r.data.data.exists;
-
-        // Si el endpoint responde pero no manda exists, lo marcamos como "desconocido"
-        // (la lógica de envío abajo solo envía si exists === true)
-        return { ok: true, exists, raw: r.data, used: ep };
-      } catch (e) {
-        const st = e?.response?.status;
-        const data = e?.response?.data;
-        const msg = e?.message || '';
-
-        // Si es 404, probamos el siguiente endpoint
-        if (st === 404) {
-          dbg('check endpoint 404 en', ep, '→ probando otro');
-          continue;
-        }
-
-        warn('POST check-whatsapp ERROR', 'ep:', ep, 'status:', st, 'resp:', pretty(data), 'msg:', msg);
-        return { ok: false, exists: null, error: msg, raw: data, used: ep };
-      }
-    }
-
-    // Ninguno existe => devolvemos ok=false (y tu lógica hará skip por seguridad)
-    warn('No se encontró endpoint de verificación (check-whatsapp/check-number).');
-    return { ok: false, exists: null, error: 'NoCheckEndpoint', raw: null, used: 'none' };
-  }
-
-  async function reportExistencia(payload) {
-    try {
-      await axios.post(cfg.existenciaEndpoint, payload, {
-        timeout: 15000,
-        headers: { 'Content-Type': 'application/json' }
-      });
-    } catch (e) {
-      logHttpFailure('existencia', e);
-    }
-  }
-
   // ==================== PROCESADOR ====================
   async function processCampaignFile(filePath, { modeLabel }) {
+    logServerClock('processCampaignFile:ENTER', { file: filePath, modeLabel });
+    appendRuntimeLog(CAMPANAS_DIR, { tag: 'PROCESS_ENTER', file: filePath, modeLabel });
+
     // 🔒 Lock filesystem
     const lock = acquireFileLock(filePath);
     if (!lock.ok) {
       const cid = loadJSON(filePath)?.campana?.id || 0;
-      logAction('envio_mensaje', { fase: 'skip_duplicado', archivo: filePath, motivo: `LOCK:${lock.reason}` });
+      logAction('envio_mensaje', { fase: 'skip_duplicado', archivo: filePath, motivo: `LOCK:${lock.reason}`, server_now: new Date().toISOString() });
       await postStatus({ action: 'skip_duplicado', id_campana: cid, fase: 'skip_duplicado' });
       dbg('LOCK detectado, skip', filePath, lock.reason);
+      appendRuntimeLog(CAMPANAS_DIR, { tag: 'SKIP_LOCK', file: filePath, reason: lock.reason });
       return;
     }
 
     // Evitar dobles ejecuciones en memoria
     if (IN_FLIGHT.has(filePath)) {
       const cid = loadJSON(filePath)?.campana?.id || 0;
-      logAction('envio_mensaje', { fase: 'skip_duplicado', archivo: filePath, motivo: 'IN_FLIGHT' });
+      logAction('envio_mensaje', { fase: 'skip_duplicado', archivo: filePath, motivo: 'IN_FLIGHT', server_now: new Date().toISOString() });
       await postStatus({ action: 'skip_duplicado', id_campana: cid, fase: 'skip_duplicado' });
       dbg('IN_FLIGHT detectado, skip', filePath);
+      appendRuntimeLog(CAMPANAS_DIR, { tag: 'SKIP_IN_FLIGHT', file: filePath });
       releaseFileLock(filePath);
       return;
     }
 
     IN_FLIGHT.add(filePath);
-    info('Procesando campaña:', path.basename(filePath), 'modo:', modeLabel);
+    info('Procesando campaña:', path.basename(filePath), 'modo:', modeLabel, '| server_now:', new Date().toISOString());
 
     const startedAt = Date.now();
 
@@ -698,6 +420,7 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
       let data = loadJSON(filePath);
       if (!data || !data.campana || !Array.isArray(data.destinatarios)) {
         warn('JSON de campaña inválido, aborta', filePath);
+        appendRuntimeLog(CAMPANAS_DIR, { tag: 'ABORT_INVALID_JSON', file: filePath });
         return;
       }
 
@@ -705,12 +428,14 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
       if (String(data.estado_campana || '').toLowerCase() === 'cancelado') {
         info('Campaña en estado "cancelado". No se procesa.', filePath);
         await postStatus({ action: 'cancelado', id_campana: data.campana.id, fase: 'inicio' });
+        appendRuntimeLog(CAMPANAS_DIR, { tag: 'ABORT_CANCELLED', file: filePath, id: data.campana.id });
         return;
       }
 
       const currentState = data.estado_campana || 'pendiente';
       if (currentState === 'en_proceso' || currentState === 'finalizada') {
         dbg('Estado no ejecutable, aborta:', currentState);
+        appendRuntimeLog(CAMPANAS_DIR, { tag: 'ABORT_STATE', file: filePath, state: currentState });
         return;
       }
 
@@ -726,18 +451,43 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
       const pausaCada = Math.max(0, parseInt(campana.mensajes_para_pausa, 10) || 0);
       const pausaMs   = toMs(String(campana.tiempo_para_cantidad || '').trim());
 
+      info('PROCESS config:', {
+        id_campana: campana.id,
+        modeLabel,
+        baseUrl,
+        sendUrl,
+        sessionId,
+        fecha_hora_envio: campana.fecha_hora_envio || null,
+        intervalMs,
+        pausaCada,
+        pausaMs,
+        server_now: new Date().toISOString()
+      });
+
       // Diferido: respeta hora exacta
       if (String(modeLabel).toLowerCase() === 'diferido') {
         const when = parseLocalDateTime(campana.fecha_hora_envio);
+        logScheduleDetail('processCampaignFile:diferido_wait', campana.fecha_hora_envio, when);
+
         const delayToStart = Math.max(0, when.getTime() - Date.now());
         if (delayToStart > 0) {
-          info('Esperando hasta hora programada (Guayaquil)', when.toISOString());
+          info('Esperando hasta hora programada (Guayaquil). Faltan:', core.msToHuman(delayToStart), '| server_now:', new Date().toISOString());
           await sleep(delayToStart);
+          info('Desperté del sleep diferido. server_now:', new Date().toISOString(), '| debería ser >= when:', when.toISOString());
+        } else {
+          warn('Diferido vencido (fecha pasada). Se ejecuta inmediatamente.', {
+            fecha_hora_envio: campana.fecha_hora_envio,
+            when_iso: when.toISOString(),
+            server_now: new Date().toISOString()
+          });
         }
+      } else {
+        // ✅ Realtime: IGNORA fecha_hora_envio y arranca YA
+        info('Realtime: no espera. Inicia envío de inmediato. server_now:', new Date().toISOString(), '| fecha_hora_envio_ignorada:', campana.fecha_hora_envio || null);
       }
 
-      // Tokens variables_globales
-      const tokenReplacer = await prepareTokenReplacer(campana.mensaje);
+      // ✅ Tokens variables_globales (MIX: ##NAME## y #ID#)
+      const tokenReplacer = await prepareTokenReplacer(campana.mensaje, campana);
 
       logAction('inicio', {
         id_campana: campana.id,
@@ -750,7 +500,8 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
         pausa_cada: pausaCada,
         pausa_ms: pausaMs,
         total_destinatarios: Array.isArray(data.destinatarios) ? data.destinatarios.length : 0,
-        fecha_hora_envio: campana.fecha_hora_envio || null
+        fecha_hora_envio: campana.fecha_hora_envio || null,
+        server_now: new Date().toISOString()
       });
 
       await postStatus({ action: 'inicio', id_campana: campana.id });
@@ -765,12 +516,18 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
         return { row: d, to: toNumber, parts };
       }).filter(j => j.to);
 
+      info('JOBS construidos:', {
+        total: jobs.length,
+        ejemplo_primero: jobs[0] ? { to: jobs[0].to, parts: jobs[0].parts.slice(0, 4) } : null
+      });
+
       for (let i = 0; i < jobs.length; i++) {
         // 🔒 Check 1: antes de enviar
         const latest = loadJSON(filePath) || data;
         if (String(latest.estado_campana || '').toLowerCase() === 'cancelado') {
           info('Cancelado detectado antes de enviar el siguiente mensaje. Se detiene.', filePath);
           await postStatus({ action: 'cancelado', id_campana: latest.campana.id, fase: 'antes_de_envio' });
+          appendRuntimeLog(CAMPANAS_DIR, { tag: 'STOP_CANCELLED_BEFORE_SEND', file: filePath, idx: i });
           return;
         }
 
@@ -810,6 +567,8 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
         const messageTemplate = String(campana.mensaje);
         const replaceParams   = makeParamReplacerFromParts(j.parts);
         const withParams      = replaceParams(messageTemplate);
+
+        // ✅ Aquí reemplazamos (1) ##NAME## y (2) #ID#
         const msgForThisRecipient = tokenReplacer.replaceWithRandom(withParams);
 
         // ==================== ✅ 1) CHECK EXISTENCIA WHATSAPP (usa /check-whatsapp) ====================
@@ -842,7 +601,8 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
             idx: i,
             destinatario_id: j.row.id ?? key,
             numero: j.to,
-            motivo: !check.ok ? 'error_check' : 'no_tiene_whatsapp'
+            motivo: !check.ok ? 'error_check' : 'no_tiene_whatsapp',
+            server_now: new Date().toISOString()
           });
 
           // limpiar sending
@@ -879,11 +639,12 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
             tipo: j.row.tipo,
             estado_envio: j.row.estado_envio
           },
-          body
+          body,
+          server_now: new Date().toISOString()
         });
 
         try {
-          const resp = await axios.post(sendUrl, body, {
+          const resp = await require('axios').post(sendUrl, body, {
             timeout: 30000,
             headers: { 'Content-Type': 'application/json' }
           });
@@ -908,7 +669,8 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
             idx: i,
             destinatario_id: j.row.id ?? key,
             numero: j.to,
-            http_status: resp.status
+            http_status: resp.status,
+            server_now: new Date().toISOString()
           });
 
           await postStatus({
@@ -969,7 +731,8 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
             numero: j.to,
             http_status: st,
             error_message: e?.message || 'Error envío',
-            error_body: typeof dd === 'string' ? dd.slice(0, 400) : dd
+            error_body: typeof dd === 'string' ? dd.slice(0, 400) : dd,
+            server_now: new Date().toISOString()
           });
 
           await postStatus({
@@ -982,26 +745,30 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
 
         // Intervalo
         if (i + 1 < jobs.length && intervalMs > 0) {
+          info('Pausa intervalo antes de siguiente:', { ms: intervalMs, human: core.msToHuman(intervalMs) });
           await sleep(intervalMs);
           logAction('envio_mensaje', {
             fase: 'pausa_intervalo',
             id_campana: campana.id,
             archivo: filePath,
             ms: intervalMs,
-            next_index: i + 1
+            next_index: i + 1,
+            server_now: new Date().toISOString()
           });
           await postStatus({ action: 'pausa_intervalo', id_campana: campana.id, fase: 'pausa_intervalo' });
         }
 
         // Pausa por lote
         if (i + 1 < jobs.length && pausaCada > 0 && pausaMs > 0 && (i + 1) % pausaCada === 0) {
+          info('Pausa por lote:', { despues_de: i + 1, ms: pausaMs, human: core.msToHuman(pausaMs) });
           await sleep(pausaMs);
           logAction('envio_mensaje', {
             fase: 'pausa_lote',
             id_campana: campana.id,
             archivo: filePath,
             ms: pausaMs,
-            despues_de: i + 1
+            despues_de: i + 1,
+            server_now: new Date().toISOString()
           });
           await postStatus({ action: 'pausa_lote', id_campana: campana.id, fase: 'pausa_lote' });
         }
@@ -1050,19 +817,67 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
         errores,
         duracion_ms: durationMs,
         json_borrado: deleted,
-        delete_error: deleteError
+        delete_error: deleteError,
+        server_now: new Date().toISOString()
       });
 
-      info('Finalizada campaña:', campana.id, 'enviados:', enviados, 'errores:', errores, 'ms:', durationMs);
+      info('Finalizada campaña:', campana.id, 'enviados:', enviados, 'errores:', errores, 'ms:', durationMs, '| server_now:', new Date().toISOString());
 
     } finally {
       try { IN_FLIGHT.delete(filePath); } catch {}
       try { releaseFileLock(filePath); } catch {}
+      logServerClock('processCampaignFile:EXIT', { file: filePath, modeLabel });
+      appendRuntimeLog(CAMPANAS_DIR, { tag: 'PROCESS_EXIT', file: filePath, modeLabel });
     }
   }
 
-  // ==================== GUARDIA ====================
+  // ==================== GUARDIA REALTIME ====================
+  async function guardScanRealtime() {
+    try {
+      const files = fs.readdirSync(RT_DIR).filter(f => f.endsWith('.json'));
+      if (files.length) {
+        logServerClock('RT_GUARD:tick', { count: files.length });
+      } else {
+        dbg('RT_GUARD:tick', { count: 0 });
+      }
+
+      for (const f of files) {
+        const p = path.join(RT_DIR, f);
+        const data = loadJSON(p);
+        if (!data || !data.campana) {
+          dbg('RT_GUARD: JSON inválido', p);
+          continue;
+        }
+
+        const estado = String(data.estado_campana || 'pendiente').toLowerCase();
+        if (estado === 'en_proceso' || estado === 'finalizada' || estado === 'cancelado') {
+          dbg('RT_GUARD: skip por estado', estado, p);
+          continue;
+        }
+
+        // En realtime ignoramos fecha_hora_envio
+        const whenStr = data.campana.fecha_hora_envio || null;
+        if (whenStr) {
+          const when = parseLocalDateTime(whenStr);
+          logScheduleDetail('RT_GUARD:realtime_ignora_fecha', whenStr, when);
+        }
+
+        if (IN_FLIGHT.has(p)) {
+          dbg('RT_GUARD: ya en IN_FLIGHT', path.basename(p));
+          continue;
+        }
+
+        info('RT_GUARD: disparo realtime', { file: path.basename(p), id: data.campana.id, server_now: new Date().toISOString() });
+        processCampaignFile(p, { modeLabel: 'en_tiempo_real' }).catch(error);
+      }
+    } catch (e) {
+      error('RT_GUARD error:', e?.message || e);
+    }
+  }
+
   async function guardScanDiferido() {
+    logServerClock('GUARD:tick');
+
     try {
       const files = fs.readdirSync(DF_DIR).filter(f => f.endsWith('.json'));
       dbg('Guardia: archivos en diferido', files.length);
@@ -1083,12 +898,22 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
 
         const when = parseLocalDateTime(data.campana.fecha_hora_envio);
         const due = Date.now() >= when.getTime();
+        const diff = when.getTime() - Date.now();
+
+        info('GUARD:campaña', {
+          file: path.basename(p),
+          id: data.campana.id,
+          fecha_hora_envio: data.campana.fecha_hora_envio,
+          when_iso: when.toISOString(),
+          due,
+          faltan: core.msToHuman(diff)
+        });
 
         if (SCHEDULES.has(p)) {
           if (due && !IN_FLIGHT.has(p)) {
             clearTimeout(SCHEDULES.get(p));
             SCHEDULES.delete(p);
-            logAction('envio_mensaje', { fase: 'guard_trigger_immediate', archivo: p });
+            logAction('envio_mensaje', { fase: 'guard_trigger_immediate', archivo: p, server_now: new Date().toISOString() });
             await postStatus({ action: 'guard_trigger_immediate', id_campana: data.campana.id, fase: 'guard_trigger_immediate' });
             info('Guardia: disparo inmediato', path.basename(p));
             processCampaignFile(p, { modeLabel: 'diferido' }).catch(error);
@@ -1098,13 +923,13 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
 
         if (due) {
           if (!IN_FLIGHT.has(p)) {
-            logAction('envio_mensaje', { fase: 'guard_trigger_now', archivo: p });
+            logAction('envio_mensaje', { fase: 'guard_trigger_now', archivo: p, server_now: new Date().toISOString() });
             await postStatus({ action: 'guard_trigger_now', id_campana: data.campana.id, fase: 'guard_trigger_now' });
             info('Guardia: disparo NOW', path.basename(p));
             processCampaignFile(p, { modeLabel: 'diferido' }).catch(error);
           }
         } else {
-          info('Guardia: programando pendiente', path.basename(p), 'para', when.toISOString());
+          info('Guardia: programando pendiente', path.basename(p), 'para', when.toISOString(), '| faltan:', core.msToHuman(diff));
           scheduleDiferido(p);
         }
       }

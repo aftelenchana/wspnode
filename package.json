@@ -3,9 +3,9 @@
   "version": "1.0.1",
   "main": "server.js",
   "scripts": {
-    "start": "pm2 start ecosystem.config.js",
-    "reload": "pm2 reload ecosystem.config.js",
-    "stop": "pm2 delete wsp || true"
+    "start": "node server.js",
+    "dev": "node server.js",
+    "stop": "node -e \"console.log('Stop: con node no hay daemon; cierra la consola o mata el PID')\""
   },
   "dependencies": {
     "@ffmpeg-installer/ffmpeg": "^1.1.0",
