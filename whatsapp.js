@@ -119,8 +119,8 @@ function pickMsgType(msg) {
 // ===================== Config inyectable desde server.js =====================
 let CFG = {
   url_sistema: 'https://wsp.guibis.com',
-  endpoint: '/dev/wspguibis/system_gtp',
-  endpoint_salida: '/dev/wspguibis/system_gtp_salientes'
+  endpoint: '/whatsapp/api/chatbot/incoming',
+  endpoint_salida: '/whatsapp/api/chatbot/outgoing'
 };
 
 function initWhatsapp({ url_sistema, endpoint, endpoint_salida }) {
@@ -194,6 +194,36 @@ const contactsStore = {};
 const chatsStore = {};
 const reconnectTimers = {};
 const reconnectAttempts = {};
+const storeSaveTimers = {};
+
+function scheduleSaveStore(sessionId) {
+  if (storeSaveTimers[sessionId]) clearTimeout(storeSaveTimers[sessionId]);
+  storeSaveTimers[sessionId] = setTimeout(() => {
+    try {
+      const cMap = contactsStore[sessionId];
+      const chMap = chatsStore[sessionId];
+      const sessionDir = path.join(__dirname, 'sessions', sessionId);
+      if (!fs.existsSync(sessionDir)) return;
+      if (cMap) fs.writeFileSync(path.join(sessionDir, 'contacts.json'), JSON.stringify(Array.from(cMap.entries())));
+      if (chMap) fs.writeFileSync(path.join(sessionDir, 'chats.json'), JSON.stringify(Array.from(chMap.entries())));
+    } catch(e) {}
+  }, 5000);
+}
+
+function loadStore(sessionId) {
+  contactsStore[sessionId] = new Map();
+  chatsStore[sessionId] = new Map();
+  const sessionDir = path.join(__dirname, 'sessions', sessionId);
+  try {
+    const cData = fs.readFileSync(path.join(sessionDir, 'contacts.json'), 'utf8');
+    contactsStore[sessionId] = new Map(JSON.parse(cData));
+  } catch(e) {}
+  try {
+    const chData = fs.readFileSync(path.join(sessionDir, 'chats.json'), 'utf8');
+    chatsStore[sessionId] = new Map(JSON.parse(chData));
+  } catch(e) {}
+}
+
 
 // ===================== Utils =====================
 async function ensureDir(dir) {
@@ -259,8 +289,7 @@ async function createSession(sessionId) {
   sock.connectionStatus = 'inactiva';
   clearReconnect(sessionId);
 
-  contactsStore[sessionId] = new Map();
-  chatsStore[sessionId] = new Map();
+  loadStore(sessionId);
 
   // store
   sock.ev.on('messaging-history.set', ({ chats, contacts }) => {
@@ -274,16 +303,18 @@ async function createSession(sessionId) {
           const prev = cMap.get(jid);
           cMap.set(jid, mergeObjects(prev, c));
         }
+        scheduleSaveStore(sessionId);
       }
       if (chats && chMap) {
         for (const ch of chats) {
           if (!ch?.id) continue;
           const jid = jidNormalizedUser(ch.id);
           const prev = chMap.get(jid);
-          chMap.set(jid, mergeObjects(prev, ch));
+          chMap.set(jid, prev ? { ...prev, ...ch } : ch);
         }
+        scheduleSaveStore(sessionId);
       }
-    } catch {}
+    } catch (e) {}
   });
 
   sock.ev.on('contacts.set', (payload) => {
@@ -294,9 +325,12 @@ async function createSession(sessionId) {
         if (!c?.id) continue;
         const jid = jidNormalizedUser(c.id);
         const prev = map.get(jid);
-        map.set(jid, mergeObjects(prev, c));
+        map.set(jid, prev ? { ...prev, ...c } : c);
       }
-    } catch {}
+      scheduleSaveStore(sessionId);
+    } catch (e) {
+      logErr(sessionId, 'Error en contacts.set', e);
+    }
   });
 
   sock.ev.on('contacts.upsert', (arr) => {
@@ -309,7 +343,8 @@ async function createSession(sessionId) {
         const prev = map.get(jid);
         map.set(jid, mergeObjects(prev, c));
       }
-    } catch {}
+      scheduleSaveStore(sessionId);
+    } catch (e) {}
   });
 
   sock.ev.on('contacts.update', (arr) => {
@@ -320,9 +355,12 @@ async function createSession(sessionId) {
         if (!u?.id) continue;
         const jid = jidNormalizedUser(u.id);
         const prev = map.get(jid);
-        map.set(jid, mergeObjects(prev, u));
+        map.set(jid, prev ? { ...prev, ...u } : u);
       }
-    } catch {}
+      scheduleSaveStore(sessionId);
+    } catch (e) {
+      logErr(sessionId, 'Error en contacts.update', e);
+    }
   });
 
   sock.ev.on('chats.set', ({ chats }) => {
@@ -333,9 +371,12 @@ async function createSession(sessionId) {
         if (!ch?.id) continue;
         const jid = jidNormalizedUser(ch.id);
         const prev = map.get(jid);
-        map.set(jid, mergeObjects(prev, ch));
+        map.set(jid, prev ? { ...prev, ...ch } : ch);
       }
-    } catch {}
+      scheduleSaveStore(sessionId);
+    } catch (e) {
+      logErr(sessionId, 'Error en chats.set', e);
+    }
   });
 
   sock.ev.on('chats.upsert', (chats) => {
@@ -383,6 +424,22 @@ async function createSession(sessionId) {
       if (connection === 'open') {
         sock.connectionStatus = 'activa';
         clearReconnect(sessionId);
+        
+        // AUTO-ASSIGN NUMBER: Notify Laravel of the real connected phone number
+        try {
+          if (sock.user && sock.user.id) {
+            const realNumber = sock.user.id.split(':')[0];
+            const url = `${CFG.url_sistema}/whatsapp/api/core/update-number`;
+            
+            log('API_SEND_OUT', { action: 'update-number', sessionId, url, numero: realNumber });
+            api.post(url, { sessionId, numero: realNumber }, {
+                headers: {
+                    'X-Internal-Key': process.env.WSP_INTERNAL_KEY || 'Guibis_Internal_Secret_2026!'
+                }
+            }).catch(() => {});
+          }
+        } catch (e) {}
+
       } else if (connection === 'close') {
         sock.connectionStatus = 'inactiva';
 
@@ -699,6 +756,40 @@ async function loadExistingSessions() {
   }
 }
 
+// ===================== GETTERS PARA CONTACTOS Y GRUPOS =====================
+function getContacts(sessionId) {
+  const map = contactsStore[sessionId];
+  if (!map) return [];
+  return Array.from(map.values());
+}
+
+function getAllChats(sessionId) {
+  const map = chatsStore[sessionId];
+  if (!map) return [];
+  return Array.from(map.values());
+}
+
+function getChatByNumber(sessionId, number) {
+  const jid = jidNormalizedUser(number + '@s.whatsapp.net');
+  const cMap = contactsStore[sessionId];
+  const chMap = chatsStore[sessionId];
+  let res = null;
+  if (cMap && cMap.has(jid)) res = cMap.get(jid);
+  if (!res && chMap && chMap.has(jid)) res = chMap.get(jid);
+  return res;
+}
+
+async function getGroupMembers(sessionId, groupId) {
+  const sock = sessions[sessionId];
+  if (!sock) throw new Error('Sesión no encontrada');
+  try {
+    const metadata = await sock.groupMetadata(groupId);
+    return metadata.participants || [];
+  } catch (e) {
+    throw new Error('Error obteniendo miembros del grupo: ' + e.message);
+  }
+}
+
 module.exports = {
   initWhatsapp,
   createSession,
@@ -707,4 +798,8 @@ module.exports = {
   closeSessionFull,
   closeSessionPrev,
   closeAllSessions,
+  getContacts,
+  getAllChats,
+  getChatByNumber,
+  getGroupMembers
 };

@@ -1,6 +1,7 @@
 // server.js
 // === Solo APIs y servidor Express ===
 
+require('dotenv').config();
 const cors = require('cors');
 const express = require('express');
 const app = express();
@@ -13,10 +14,10 @@ const mime = require('mime-types');
 const { promisify } = require('util');
 const stream = require('stream');
 
-// === Tus constantes (SIN CAMBIOS) ===
-const url_sistema = 'https://wsp.guibis.com';
-const endpoint = '/dev/wspguibis/system_gtp';
-const endpoint_salida = '/dev/wspguibis/system_gtp_salientes';
+// === Constantes del .env ===
+const url_sistema = process.env.URL_SISTEMA || 'https://wsp.guibis.com';
+const endpoint = process.env.ENDPOINT_INCOMING || '/whatsapp/api/chatbot/incoming';
+const endpoint_salida = process.env.ENDPOINT_OUTGOING || '/whatsapp/api/chatbot/outgoing';
 
 // 1) importar módulos propios
 const registerEnvioMasivo = require('./envio_masivo');
@@ -27,12 +28,10 @@ const makeEnvioMasivoServices = require('./envio_masivo.services');
 // Reutilizamos el motor de variables globales (##TOKEN## y #ID#)
 const envioServices = makeEnvioMasivoServices({
   cfg: {
-    // el endpoint ya existe en tu sistema
-    varsApiEndpoint: `${url_sistema}/dev/api/variables_globales`,
-
-    // estos quedan por compatibilidad (no son obligatorios para /send-message)
-    statusEndpoint: `${url_sistema}/dev/api/estado`,
-    existenciaEndpoint: `${url_sistema}/dev/api/existencia`
+    // Nuevos endpoints migrados a Laravel
+    varsApiEndpoint: `${url_sistema}/whatsapp/api/core/variables_globales`,
+    statusEndpoint: `${url_sistema}/whatsapp/api/core/estado`,
+    existenciaEndpoint: `${url_sistema}/whatsapp/api/core/existencia`
   },
   core: envioCore
 });
@@ -48,7 +47,8 @@ const {
   // === Opción B: store personalizado ===
   getContacts,
   getAllChats,
-  getChatByNumber
+  getChatByNumber,
+  getGroupMembers
 } = require('./whatsapp');
 
 // Iniciar configuración para whatsapp.js
@@ -58,6 +58,18 @@ initWhatsapp({ url_sistema, endpoint, endpoint_salida });
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use(cors());
+
+// === Middleware de Seguridad ===
+const internalKey = process.env.WSP_INTERNAL_KEY || 'Guibis_Internal_Secret_2026!';
+app.use((req, res, next) => {
+  // Solo aplicar seguridad a las rutas de la API, podemos excluir get-qr para navegadores directos
+  // pero como Laravel ahora es proxy de get-qr, todas deben llevar la key.
+  const reqKey = req.headers['x-internal-key'];
+  if (!reqKey || reqKey !== internalKey) {
+    return res.status(401).json({ error: 'No autorizado. Key inválida o faltante.' });
+  }
+  next();
+});
 
 // 2) registrar tu worker de campañas
 registerEnvioMasivo(app, {
@@ -487,6 +499,23 @@ app.post('/get-chat-by-number', (req, res) => {
   if (!item) return res.status(404).json({ ok: false, message: 'No se encontró chat/contacto para ese número' });
 
   return res.json({ ok: true, chat: item });
+});
+
+app.post('/get-group-members', async (req, res) => {
+  const { sessionId, groupId } = req.body;
+  if (!sessionId || !groupId) {
+    return res.status(400).json({ error: 'sessionId y groupId son requeridos' });
+  }
+
+  const session = sessions[sessionId];
+  if (!session) return res.status(404).json({ error: 'Sesión no encontrada en memoria' });
+
+  try {
+    const participants = await getGroupMembers(sessionId, groupId);
+    return res.json({ ok: true, count: participants.length, participants });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err.message });
+  }
 });
 
 // ===== Archivos utilitarios =====
