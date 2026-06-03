@@ -375,54 +375,38 @@ app.post('/send-message', async (req, res) => {
     }
 
     // =========================================================
-    // ✅ TU LÓGICA ORIGINAL (archivos + caption)
+    // ✅ PROCESAMIENTO DE MULTIMEDIA POR BASE64
     // =========================================================
-    const urlRegex = /(https?:\/\/[^\s]+\.(jpg|jpeg|png|gif|pdf|mp4|docx|xlsx|zip|xml))/ig;
-    const urlMatches = messageFinal.match(urlRegex);
-    const textWithoutUrls = messageFinal.replace(urlRegex, '').trim();
-
+    // mediaBase64 esperado: [ { base64: "iV...", mimeType: "image/png", fileName: "doc.pdf" } ]
     let textUsedAsCaption = false;
+    let archivosProcesados = 0;
+    let mediaBase64 = req.body.mediaBase64;
 
-    if (urlMatches && urlMatches.length) {
-      for (const fileUrl of urlMatches) {
-        const fileName = path.basename(fileUrl.split('?')[0]); // soporta URLs con querystring
-        const filePath = path.join(filesDir, fileName);
-
-        if (!fs.existsSync(filePath)) {
-          const response = await axios({
-            url: fileUrl,
-            method: 'GET',
-            responseType: 'stream',
-            timeout: 30000
-          });
-
-          const writer = fs.createWriteStream(filePath);
-          response.data.pipe(writer);
-
-          await new Promise((resolve, reject) => {
-            writer.on('finish', resolve);
-            writer.on('error', reject);
-          });
-
-          console.log(`Archivo descargado: ${filePath}`);
-        } else {
-          console.log(`Archivo ya existe: ${filePath}`);
+    if (Array.isArray(mediaBase64) && mediaBase64.length > 0) {
+      for (const fileObj of mediaBase64) {
+        if (!fileObj.base64) continue;
+        
+        let base64Data = fileObj.base64;
+        // Remover el prefijo data:image/png;base64, si lo envían
+        if (base64Data.includes('base64,')) {
+          base64Data = base64Data.split('base64,')[1];
         }
 
-        const fileBuffer = fs.readFileSync(filePath);
-        const mimeType = mime.lookup(filePath) || 'application/octet-stream';
+        const fileBuffer = Buffer.from(base64Data, 'base64');
+        const mimeType = fileObj.mimeType || 'application/octet-stream';
+        const fileName = fileObj.fileName || `file_${Date.now()}`;
 
         if (mimeType.startsWith('image/')) {
           await session.sendMessage(`${to}@s.whatsapp.net`, {
             image: fileBuffer,
-            caption: !textUsedAsCaption && textWithoutUrls ? textWithoutUrls : null
+            caption: !textUsedAsCaption && messageFinal ? messageFinal : null
           });
           textUsedAsCaption = true;
 
         } else if (mimeType.startsWith('video/')) {
           await session.sendMessage(`${to}@s.whatsapp.net`, {
             video: fileBuffer,
-            caption: !textUsedAsCaption && textWithoutUrls ? textWithoutUrls : null
+            caption: !textUsedAsCaption && messageFinal ? messageFinal : null
           });
           textUsedAsCaption = true;
 
@@ -430,26 +414,26 @@ app.post('/send-message', async (req, res) => {
           await session.sendMessage(`${to}@s.whatsapp.net`, {
             document: fileBuffer,
             mimetype: mimeType,
-            fileName
+            fileName: fileName
           });
         }
+        archivosProcesados++;
       }
     }
 
-    // Si no hubo media con caption, enviamos texto normal
-    if (!textUsedAsCaption && textWithoutUrls) {
-      await session.sendMessage(`${to}@s.whatsapp.net`, { text: textWithoutUrls });
+    // Si no hubo media con caption o el mensaje original no fue usado como caption
+    if (!textUsedAsCaption && messageFinal) {
+      await session.sendMessage(`${to}@s.whatsapp.net`, { text: messageFinal });
     }
 
     return res.json({
       ok: true,
       message: 'Mensaje enviado correctamente.',
-      // útil para debug cuando uses variables
       debug: {
         original: String(message).slice(0, 200),
         final: String(messageFinal).slice(0, 200),
         uso_caption: textUsedAsCaption,
-        archivos_detectados: urlMatches ? urlMatches.length : 0
+        archivos_procesados: archivosProcesados
       }
     });
 

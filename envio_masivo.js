@@ -560,6 +560,9 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
 
         // ==================== ✅ 2) ENVIAR MENSAJE ====================
         const body = { sessionId, to: j.to, message: msgForThisRecipient };
+        if (campana.mediaBase64 && campana.mediaBase64.length > 0) {
+            body.mediaBase64 = campana.mediaBase64;
+        }
         dbg('POST send-message → url:', sendUrl, 'body:', pretty(body));
 
         logAction('envio_mensaje', {

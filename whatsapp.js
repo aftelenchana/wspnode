@@ -580,43 +580,30 @@ async function handleBotReplyAndMedia(sock, toJid, botData) {
   if (!botData || botData.fuente !== 'bot_interno') return;
 
   const mensaje = botData.mensaje || '';
-  if (!mensaje.trim()) return;
-
-  const urlRegex = /(https?:\/\/[^\s]+\.(jpg|jpeg|png|gif|pdf|mp4|docx|xlsx|zip|xml))/ig;
-  const urlMatches = mensaje.match(urlRegex);
-  const textWithoutUrls = mensaje.replace(urlRegex, '').trim();
+  if (!mensaje.trim() && !(botData.mediaBase64 && botData.mediaBase64.length)) return;
 
   let textUsedAsCaption = false;
 
-  // Archivos detectados en texto
-  if (urlMatches && urlMatches.length) {
-    const filesDir = await ensureDir(path.join(__dirname, 'files'));
-
-    for (const fileUrl of urlMatches) {
+  // Archivos en Base64
+  if (botData.mediaBase64 && Array.isArray(botData.mediaBase64) && botData.mediaBase64.length) {
+    for (const fileObj of botData.mediaBase64) {
+      if (!fileObj.base64) continue;
       try {
-        const fileName = path.basename(fileUrl.split('?')[0]);
-        const filePath = path.join(filesDir, fileName);
-
-        if (!fs.existsSync(filePath)) {
-          const response = await api({ url: fileUrl, method: 'GET', responseType: 'stream' });
-          const writer = fs.createWriteStream(filePath);
-          response.data.pipe(writer);
-
-          await new Promise((resolve, reject) => {
-            writer.on('finish', resolve);
-            writer.on('error', reject);
-          });
+        let base64Data = fileObj.base64;
+        if (base64Data.includes('base64,')) {
+          base64Data = base64Data.split('base64,')[1];
         }
 
-        const fileBuffer = fs.readFileSync(filePath);
-        const mimeType = mime.lookup(filePath) || 'application/octet-stream';
+        const fileBuffer = Buffer.from(base64Data, 'base64');
+        const mimeType = fileObj.mimeType || 'application/octet-stream';
+        const fileName = fileObj.fileName || `file_${Date.now()}`;
 
         if (mimeType.startsWith('image/')) {
-          await sock.sendMessage(toJid, { image: fileBuffer, caption: !textUsedAsCaption && textWithoutUrls ? textWithoutUrls : null });
+          await sock.sendMessage(toJid, { image: fileBuffer, caption: !textUsedAsCaption && mensaje ? mensaje : null });
           textUsedAsCaption = true;
           log('BOT_SEND_OK', { sessionId: botData?.sessionId, toJid, kind: 'image' });
         } else if (mimeType.startsWith('video/')) {
-          await sock.sendMessage(toJid, { video: fileBuffer, caption: !textUsedAsCaption && textWithoutUrls ? textWithoutUrls : null });
+          await sock.sendMessage(toJid, { video: fileBuffer, caption: !textUsedAsCaption && mensaje ? mensaje : null });
           textUsedAsCaption = true;
           log('BOT_SEND_OK', { sessionId: botData?.sessionId, toJid, kind: 'video' });
         } else {
@@ -630,10 +617,10 @@ async function handleBotReplyAndMedia(sock, toJid, botData) {
   }
 
   // Respuesta texto
-  if (botData.tipo_salida_voz_texto === 'Texto') {
-    if (!textUsedAsCaption && textWithoutUrls) {
+  if (botData.tipo_salida_voz_texto === 'Texto' || !botData.tipo_salida_voz_texto) {
+    if (!textUsedAsCaption && mensaje) {
       try {
-        await sock.sendMessage(toJid, { text: textWithoutUrls });
+        await sock.sendMessage(toJid, { text: mensaje });
         log('BOT_SEND_OK', { sessionId: botData?.sessionId, toJid, kind: 'text' });
       } catch (e) {
         logError('BOT_SEND_ERROR', { sessionId: botData?.sessionId, toJid, err: e?.stack || e?.message || String(e) });
@@ -644,7 +631,7 @@ async function handleBotReplyAndMedia(sock, toJid, botData) {
   else if (botData.tipo_salida_voz_texto === 'Voz') {
     try {
       const voiceLang = 'es-ES';
-      const ttsText = textWithoutUrls || ' ';
+      const ttsText = mensaje || ' ';
       const audioUrl = googleTTS.getAudioUrl(ttsText, {
         lang: voiceLang, slow: false, host: 'https://translate.google.com'
       });
