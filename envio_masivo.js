@@ -586,7 +586,10 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
         try {
           const resp = await require('axios').post(sendUrl, body, {
             timeout: 30000,
-            headers: { 'Content-Type': 'application/json' }
+            headers: { 
+              'Content-Type': 'application/json',
+              'X-Internal-Key': process.env.WSP_INTERNAL_KEY || 'Guibis_Internal_Secret_2026!'
+            }
           });
 
           dbg('POST send-message ← status:', resp.status, 'resp:', pretty(resp.data));
