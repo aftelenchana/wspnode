@@ -441,6 +441,9 @@ module.exports = function registerEnvioMasivo(app, opts = {}) {
       });
 
       await postStatus({ action: 'inicio', id_campana: campana.id });
+
+      // ✅ Notificar a Laravel: el Node está activamente enviando
+      await postStatus({ action: 'enviando', id_campana: campana.id });
       
       let errores = 0;
 
