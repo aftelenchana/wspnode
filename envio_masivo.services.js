@@ -279,7 +279,13 @@ module.exports = function makeEnvioMasivoServices({ cfg, core }) {
       const url = `${baseUrl}/check-session`;
       const body = { sessionId };
       dbg('POST check-session → url:', url, 'body:', pretty(body));
-      const r = await axios.post(url, body, { timeout: 8000 });
+      const r = await axios.post(url, body, { 
+        timeout: 8000,
+        headers: { 
+          'Content-Type': 'application/json',
+          'X-Internal-Key': process.env.WSP_INTERNAL_KEY || 'Guibis_Internal_Secret_2026!'
+        }
+      });
       dbg('POST check-session ← status:', r.status, 'resp:', pretty(r.data));
       return { ok: true, data: r.data };
     } catch (e) {
@@ -315,7 +321,10 @@ module.exports = function makeEnvioMasivoServices({ cfg, core }) {
         dbg('POST check-whatsapp → url:', url, 'body:', pretty(body));
         const r = await axios.post(url, body, {
           timeout: 15000,
-          headers: { 'Content-Type': 'application/json' }
+          headers: { 
+            'Content-Type': 'application/json',
+            'X-Internal-Key': process.env.WSP_INTERNAL_KEY || 'Guibis_Internal_Secret_2026!'
+          }
         });
         dbg('POST check-whatsapp ← status:', r.status, 'resp:', pretty(r.data));
 
