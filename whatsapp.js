@@ -1,6 +1,6 @@
 // whatsapp.js (SIN RESTRICCIONES: TODO entra/sale + LOGS CLARITOS)
 // ✅ LOGS SOLO CONSOLA (NO ARCHIVOS)
-// ✅ Multimedia ENTRANTE: NO renombra, NO descarga, NO guarda, NO manda a API
+// ✅ Multimedia ENTRANTE: Descarga, convierte a base64 y reenvía a Laravel + Webhooks
 
 const fs = require('fs');
 const path = require('path');
@@ -13,7 +13,7 @@ const { Boom } = require('@hapi/boom');
 const {
   default: makeWASocket,
   useMultiFileAuthState,
-  // downloadMediaMessage, // ❌ ya no se usa (multimedia entrante se ignora)
+  downloadMediaMessage, // ✅ necesario para descargar multimedia entrante
   fetchLatestBaileysVersion,
   jidNormalizedUser,
 } = require('@whiskeysockets/baileys');
@@ -118,7 +118,7 @@ function pickMsgType(msg) {
 
 // ===================== Config inyectable desde server.js =====================
 let CFG = {
-  url_sistema: 'https://wsp.guibis.com',
+  url_sistema: 'http://localhost',
   endpoint: '/whatsapp/api/chatbot/incoming',
   endpoint_salida: '/whatsapp/api/chatbot/outgoing'
 };
@@ -482,7 +482,7 @@ async function createSession(sessionId) {
       else if (msg.message.text) messageContent = msg.message.text;
       else if (msg.message.extendedTextMessage) messageContent = msg.message.extendedTextMessage.text;
 
-      // MULTIMEDIA (IGNORAR COMPLETAMENTE: no renombra, no guarda, no API)
+      // ── Detectar si es multimedia ──────────────────────────────────────────
       const isIncomingMedia =
         !!msg.message.imageMessage ||
         !!msg.message.documentMessage ||
@@ -490,18 +490,44 @@ async function createSession(sessionId) {
         !!msg.message.videoMessage ||
         !!msg.message.stickerMessage;
 
+      let mediaBase64   = null;
+      let mediaMimeType = null;
+      let mediaFileName = null;
+
       if (isIncomingMedia) {
-        // Solo para log de ingreso (como tu querías “sin perder estructura”)
-        const msg_preview = `[${msgType}] ignorado (multimedia entrante)`;
-        log('MSG_IN', { sessionId, msgId, remoteJid, msgType, msg_preview });
-        return;
+        log('MSG_IN', { sessionId, msgId, remoteJid, msgType, msg_preview: `[${msgType}] multimedia entrante — descargando...` });
+        try {
+          const buffer = await downloadMediaMessage(msg, 'buffer', {});
+          if (buffer) {
+            // Determinar mimeType y nombre de archivo
+            const imgMsg  = msg.message.imageMessage;
+            const docMsg  = msg.message.documentMessage;
+            const audMsg  = msg.message.audioMessage;
+            const vidMsg  = msg.message.videoMessage;
+            const stkMsg  = msg.message.stickerMessage;
+
+            mediaMimeType = imgMsg?.mimetype || docMsg?.mimetype || audMsg?.mimetype || vidMsg?.mimetype || stkMsg?.mimetype || 'application/octet-stream';
+            const ext = mime.extension(mediaMimeType) || 'bin';
+            mediaFileName = docMsg?.fileName || `media_${msgId}.${ext}`;
+            mediaBase64 = `data:${mediaMimeType};base64,` + buffer.toString('base64');
+
+            // Para texto descriptivo
+            messageContent = docMsg?.fileName || `[${msgType}]`;
+          }
+        } catch (dlErr) {
+          log('MSG_IN', { sessionId, msgId, remoteJid, msgType, msg_preview: `[${msgType}] no se pudo descargar: ${dlErr?.message}` });
+          // Si falla la descarga, seguimos con messageContent vacío
+          messageContent = `[${msgType}]`;
+        }
       }
 
       const msg_in = String(messageContent || '');
       const msg_preview = msg_in.length > 300 ? (msg_in.slice(0, 300) + '...') : msg_in;
 
-      // LOG ingreso SIEMPRE
-      log('MSG_IN', { sessionId, msgId, remoteJid, msgType, msg_preview });
+      // LOG ingreso
+      if (!isIncomingMedia) {
+        log('MSG_IN', { sessionId, msgId, remoteJid, msgType, msg_preview });
+      }
 
       // Responder al mismo JID exacto
       const replyJid = remoteJid;
@@ -509,7 +535,6 @@ async function createSession(sessionId) {
       try {
         const url = `${CFG.url_sistema}${CFG.endpoint}`;
 
-        // TEXT (único que va a API)
         const payload = {
           sessionId,
           from: remoteJid,
@@ -517,9 +542,14 @@ async function createSession(sessionId) {
           user: 'usuario',
           msgType,
           msgId,
+          // ── Multimedia ─────────────────────────────
+          media_base64:   mediaBase64,
+          media_mime:     mediaMimeType,
+          media_filename: mediaFileName,
+          es_media:       isIncomingMedia,
         };
 
-        log('API_SEND_IN_TEXT', { sessionId, url, payload });
+        log('API_SEND_IN_TEXT', { sessionId, url, payload: { ...payload, media_base64: mediaBase64 ? '[BASE64_OMITIDO_EN_LOG]' : null } });
 
         const t0 = Date.now();
         const response = await api.post(url, payload);
@@ -527,7 +557,10 @@ async function createSession(sessionId) {
 
         log('API_RECV_IN_TEXT', { sessionId, ms, status: response.status, data: response.data });
 
-        await handleBotReplyAndMedia(sock, replyJid, response.data);
+        // Solo responder al usuario si NO es multimedia (para no enviar respuestas raras a fotos)
+        if (!isIncomingMedia) {
+          await handleBotReplyAndMedia(sock, replyJid, response.data);
+        }
 
       } catch (e) {
         logError('INCOMING_HANDLER_ERROR', {
